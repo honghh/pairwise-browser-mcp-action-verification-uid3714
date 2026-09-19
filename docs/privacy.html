@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy - Browser MCP by Agent360</title>
+  <meta name="description" content="Browser MCP runs on your own machine with no telemetry, no analytics and no account. This policy explains what the extension accesses, what it keeps locally, and what leaves your machine through your AI client.">
+  <link rel="canonical" href="https://browsermcp.dev/privacy.html">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Privacy Policy - Browser MCP by Agent360">
+  <meta property="og:description" content="Browser MCP runs on your own machine with no telemetry, no analytics and no account. Nothing is sent to Agent360.">
+  <meta property="og:url" content="https://browsermcp.dev/privacy.html">
+  <meta property="og:image" content="https://browsermcp.dev/og-image.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://browsermcp.dev/og-image.jpg">
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
+  <style>
+    body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.8; max-width: 700px; margin: 0 auto; padding: 40px 24px; }
+    h1 { font-size: 28px; margin-bottom: 8px; }
+    h2 { font-size: 20px; margin-top: 32px; color: #58a6ff; }
+    p, li { color: #8b949e; }
+    a { color: #58a6ff; }
+    .updated { color: #8b949e; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>Privacy Policy</h1>
+  <p class="updated">Last updated: September 11, 2026</p>
+
+  <p><strong>Browser MCP</strong> is an open source Chrome extension + MCP server by <a href="https://agent360.dk">Agent360</a>. We take your privacy seriously.</p>
+
+  <h2>Data Collection</h2>
+  <p>Browser MCP does <strong>not</strong> send any personal data to Agent360 or to anyone else. Specifically:</p>
+  <ul>
+    <li>No browsing history is collected or sent anywhere</li>
+    <li>No cookies or login credentials are read by our servers</li>
+    <li>No analytics, tracking, or telemetry is included</li>
+    <li>Nothing is sent to Agent360 - there is no server of ours to receive it</li>
+    <li>The extension keeps a short log on your own machine of which tools ran (time, tool name and session), shown in its popup. From version 1.29.1 it does not keep what the agent typed, cookie values or page addresses, and clears those from older entries when it updates. You can empty the log from the popup</li>
+  </ul>
+
+  <h2>How Browser MCP Works</h2>
+  <p>Browser MCP runs on your own machine:</p>
+  <ul>
+    <li>The Chrome extension communicates with a local MCP server via WebSocket (localhost only)</li>
+    <li>The MCP server communicates with Claude Code (or other MCP clients) via stdio</li>
+    <li>Browser MCP itself contacts no server of ours or any third party. What does leave your machine: the pages your agent reads go to your AI client and on to its model provider; the browser visits the sites your agent opens; and <code>npx @agent360/browser-mcp@latest</code> looks the package up on npm once when the server starts</li>
+  </ul>
+
+  <p>The localhost WebSocket bridge is not password-protected - it trusts connections from your own machine. That means the extension is only as private as your computer: any software already running on it could, in principle, connect to the same local port. Browser MCP never exposes this bridge beyond <code>localhost</code>, and the bridge itself sends nothing off your machine. If you share your computer with untrusted software, disable or remove the extension when you are not using it.</p>
+
+  <h2>Permissions</h2>
+  <p>Browser MCP requests the following Chrome permissions. Each is required for browser automation functionality:</p>
+  <ul>
+    <li><strong>tabs, tabGroups, activeTab</strong> - See and switch between the session's own tabs, and group them by colour. The agent acts only on tabs the session opened, never on a tab you opened yourself</li>
+    <li><strong>cookies</strong> - Read and write cookies for browser_get_cookies / browser_set_cookies, and only for the http(s) sites the session has open</li>
+    <li><strong>scripting</strong> - Execute JavaScript in page context for content reading and interaction</li>
+    <li><strong>debugger</strong> - Chrome DevTools Protocol for reliable mouse and keyboard events, screenshots, running scripts on CSP-strict sites, and reading network responses for browser_wait_for_network</li>
+    <li><strong>webNavigation</strong> - List a page's frames, so a tool can reach into an iframe</li>
+    <li><strong>storage, alarms, offscreen</strong> - Local extension state, two timers (one keeps the bridge alive, one releases a port when a session's last tab closes), and the offscreen document that hosts the WebSocket bridge</li>
+    <li><strong>notifications</strong> - Alert you when a human-in-the-loop action is needed</li>
+    <li><strong>&lt;all_urls&gt; (host permission)</strong> - Browser automation requires access to whatever website you navigate to</li>
+  </ul>
+
+  <h2>Open Source</h2>
+  <p>Browser MCP is fully open source under the MIT License. You can inspect all code at <a href="https://github.com/Agent360dk/browser-mcp">github.com/Agent360dk/browser-mcp</a>.</p>
+
+  <h2>Contact</h2>
+  <p>Questions? Email <a href="mailto:hello@agent360.dk">hello@agent360.dk</a> or open an issue on <a href="https://github.com/Agent360dk/browser-mcp/issues">GitHub</a>.</p>
+
+  <p style="margin-top: 48px;"><a href="/">← Back to browsermcp.dev</a></p>
+</body>
+</html>

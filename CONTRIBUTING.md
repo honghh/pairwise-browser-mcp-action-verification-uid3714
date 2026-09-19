@@ -1,0 +1,209 @@
+# Contributing to Browser MCP
+
+Thanks for your interest in contributing! Browser MCP is open source and welcomes contributions of all kinds.
+
+## Quick Start
+
+```bash
+# Clone the repo
+git clone https://github.com/Agent360dk/browser-mcp.git
+cd browser-mcp
+
+# Install MCP server dependencies
+cd mcp-server && npm install && cd ..
+
+# Load extension in Chrome
+# 1. Go to chrome://extensions
+# 2. Enable Developer mode
+# 3. Click "Load unpacked"
+# 4. Select the extension/ folder
+
+# Add to Claude Code
+claude mcp add browser-mcp -- node "$(pwd)/mcp-server/index.js"
+
+# Test it
+npm --prefix mcp-server test     # the full suite, no Chrome needed - runs in CI and before every release
+#                                  Run ONE suite at a time: some tests bind real ports (9876-9895), so two
+#                                  concurrent runs fail each other. Measured 2026-09-12: solo 4x green,
+#                                  two at once produced 1-6 unrelated-looking failures.
+npm --prefix mcp-server run flow # every tool against a REAL Chrome (needs the extension loaded)
+
+# Or by hand
+# Open Claude Code and try: browser_navigate("https://example.com")
+```
+
+### The two test layers
+
+`npm test` reads the source and runs the real functions against stubs: tool-surface coverage
+(every tool wired through tools.js → methodMap → background.js dispatch → README), session
+isolation, the tab cap, the extension-conflict logic, release coherence. Fast, no browser,
+safe in CI. The release script gates on it.
+
+**What it does not prove.** The extension sends the page expressions as strings, and in this
+layer the test answers them - they are never executed against a document. So `npm test` proves
+what the extension sends, in what order, with what arguments, and how it judges the answers it
+gets back. It does not prove what those expressions do in a real DOM. A typo inside an injected
+expression can pass the whole suite.
+
+Four tools go further and actually run the generated expression against a hand-written document
+(`test/klik-bevis.test.mjs`, `test/select-aftryk.test.mjs`). That is the pattern to copy when you
+touch a tool that builds a non-trivial page expression, and it is the only layer where you can
+prove a fix without a browser. An outside contributor reproduced a real bug that way in
+September 2026, with no Chrome, no React and nothing installed.
+
+`npm run flow` drives an actual Chrome against `test/flow/fixture.html` and calls all 40 tools
+for real, reporting OK / FEJL / SPRUNGET per tool. It cannot run in CI. Run it before a release
+and whenever you touch `extension/background.js` - it is the only layer that catches a tool that
+answers `ok: true` while the page did nothing.
+
+### Every new test has to be shown failing first
+
+Write the test, run it against the unfixed code, and confirm it goes red for the reason you
+expect. Then fix, and confirm it goes green. Put both in the commit message.
+
+This is not ceremony. Two tests added here in August could not catch the regression they were
+written for, and nobody noticed until the regression came back. A test that has never been red
+is documentation, not a guard. If the bug is already fixed, mutate the fix away, watch the test
+fail, and restore it.
+
+### About the language
+
+Code comments in `extension/background.js` and `mcp-server/` are largely in Danish. That is
+history, not policy - this started as an internal tool. Write yours in English; nobody will ask
+you to change them, and nobody will rewrite the old ones on you either. Issues, pull requests
+and commit messages in English are always fine.
+
+## Project Structure
+
+```
+extension/           # Chrome extension (Manifest V3)
+  background.js      # Service worker - all browser automation logic
+  manifest.json      # Extension config + permissions
+  offscreen.js       # WebSocket bridge to MCP server
+  popup.html/js      # Status UI
+
+mcp-server/          # MCP server (Node.js)
+  index.js           # MCP server + WebSocket client
+  tools.js           # 40 tool definitions
+  bin/cli.js         # CLI installer
+  package.json       # npm config
+
+docs/                # browsermcp.dev site - BUILD OUTPUT, never hand-edit page HTML
+content/             # Markdown sources for /docs + /compare pages (source of truth)
+scripts/             # generate-docs.py (content/ → docs/ HTML) + release tooling
+assets/              # Demo video + GIF
+```
+
+## How to Contribute
+
+### Bug Reports
+Open a [🐛 Bug Report](https://github.com/Agent360dk/browser-mcp/issues/new?template=bug.yml) - the template guides you through expected/actual/repro/version/OS.
+
+Or, in any Claude Code session with browser-mcp installed, say *"report a browser-mcp bug: …"* and Claude will draft + offer the submit link via the `browser_about` tool.
+
+### Feature Requests
+Open a [💡 Feature Wish](https://github.com/Agent360dk/browser-mcp/issues/new?template=wish.yml) - describe what you want it to do, why (your use case), and an optional example call. Wishes are curated into [WISHLIST.md](WISHLIST.md) and move to **✅ Shipped** when implemented.
+
+Or, in any Claude Code session, say *"I wish browser-mcp could …"* and Claude will draft + offer the submit link.
+
+### Share a Use-Case
+Built something cool with Browser MCP? [🎯 Share it](https://github.com/Agent360dk/browser-mcp/issues/new?template=use-case.yml) - fill in what you built, how, and (optionally) why Browser MCP was the right tool. Approved use-cases land in [USE_CASES.md](USE_CASES.md).
+
+### Code Contributions
+
+1. Fork the repo
+2. Create a branch: `git checkout -b my-feature`
+3. Make your changes in `extension/background.js` (browser logic) or `mcp-server/tools.js` (tool definitions)
+4. Test locally with Claude Code
+5. Commit: `git commit -m "feat: add my feature"`
+6. Push: `git push origin my-feature`
+7. Open a Pull Request
+
+**What happens on our side - so you know what you're walking into.**
+
+If a PR is pointing at a real problem, we merge it and fix what needs fixing *on top*,
+rather than closing it and rewriting the same change ourselves. You keep the credit for
+finding it. We only close a PR outright when the change would make something worse, and
+when we do, you get the measurement that says so - not an opinion.
+
+We have not always been good at this. Two PRs in this repo waited 46 and 59 days for a
+first reply, and both were then closed rather than merged, even though one of them was
+right about the problem. That is the bar we are trying to clear, and it is fair to hold
+us to it.
+
+If your PR has been sitting for more than a week, bump the thread. That is not rude here.
+
+### Adding a New Tool
+
+1. Add tool definition in `mcp-server/tools.js`:
+```javascript
+{
+  name: 'browser_my_tool',
+  description: 'What it does',
+  inputSchema: {
+    type: 'object',
+    properties: { /* params */ },
+  },
+}
+```
+
+2. Add handler in `extension/background.js` (in the switch/case block):
+```javascript
+case 'my_tool': {
+  const tab = await getSessionTab(port);
+  // implementation
+  return { ok: true };
+}
+```
+
+3. Add to methodMap in `mcp-server/index.js`:
+```javascript
+browser_my_tool: 'my_tool',
+```
+
+4. Update README tool count and table.
+
+### Editing the docs site (browsermcp.dev)
+
+The HTML under `docs/docs/` and `docs/compare/` is **generated** - never edit it
+directly. Edit the markdown source in `content/`, then regenerate and commit both:
+
+```bash
+python3 scripts/generate-docs.py   # deterministic; unchanged sources → clean git status
+```
+
+To schedule a page for a future date, add front matter at the very top of its
+markdown file - the generator skips the page (and drops it from sidebars/related
+links) until that date, then a regen run on/after the date publishes it. No
+database, no scheduler - a date in a file is the whole mechanism:
+
+```markdown
+---
+publish_date: 2026-08-01
+---
+```
+
+Leading `// ...` lines and `*Suggested URL/title/meta … Last verified …*` lines in
+the sources are editorial provenance - the generator strips them from rendered HTML.
+The page registry (filename → section/label/URL) is `PAGES` in `scripts/generate-docs.py`;
+new pages must be added there.
+
+### Non-Code Contributions
+
+These are equally valuable:
+- Documentation improvements
+- README translations (create `README.zh-CN.md`, `README.ja.md`, etc.)
+- Bug reports with clear reproduction steps
+- Sharing Browser MCP in your community
+
+## Code Style
+
+- No build step - plain JavaScript (ES modules)
+- `const` over `let`, `let` over `var`
+- Async/await over callbacks
+- Error messages should be helpful (include what went wrong + how to fix)
+- Comments only for non-obvious "why", not "what"
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the MIT License.

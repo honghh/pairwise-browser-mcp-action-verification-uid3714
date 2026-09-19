@@ -1,0 +1,107 @@
+# What Browser MCP can and cannot get past
+
+**Short answer:** most of the walls that stop browser automation exist because the tool is a
+stranger - a fresh browser with none of your sessions. Browser MCP is not a stranger, so those
+walls are not there for it. The walls that remain are listed here too, including the ones we
+have measured ourselves and not fixed yet.
+
+This page is deliberately unflattering in places. A capability list that only says yes is a
+brochure, and you cannot plan against a brochure.
+
+## The exchange this page is about
+
+```
+You:     Buy the cheapest ticket on that page.
+
+Claude:  [browser_click]
+         [browser_solve_captcha]
+         There is a CAPTCHA. The checkbox did not clear it on its own, so I am
+         handing it to you: solve it in the tab and tell me when to carry on.
+
+You:     done
+
+Claude:  [browser_click]
+         Booked.
+```
+
+That is a wall we clear *partly*, and the table below says so in the same words. The
+point of the page is that "can it get past X" has three answers, not two - and the
+third one is the agent saying what it cannot do instead of failing quietly.
+
+## How to read the columns
+
+| Mark | Means |
+|---|---|
+| **Measured** | We ran it against the released version and watched it work. Date in the note. |
+| **Fixed in 1.29.1** | Broken in v1.29.0, fixed and tested, and shipped in v1.29.1. Update the extension and the npm package to get it. |
+| **By design** | The mechanism is there and reviewed, but we have no dated measurement. Treat as likely, not proven. |
+| **Not yet** | We ran it and it did not work. Open, with the reason. |
+| **Won't** | A deliberate non-goal. The reason is given, not hidden. |
+
+## Walls that exist because the tool isn't you
+
+| Wall | State | Note |
+|---|---|---|
+| Site requires a login | **Measured** | It is the Chrome you are already signed into. There is no login step to fail. |
+| Session expires mid-task | **By design** | Same session as your own tab; it expires when yours does, not sooner. |
+| One-time code sent to your email | **Measured** | `browser_navigate` to the webmail tab you are already in, `browser_get_page_content`, read it, type it back. |
+| One-time code from an authenticator app | **By design** | `browser_ask_user` puts the question on the page in front of you. The agent never guesses it. |
+| Password or payment step | **By design** | Same dialog. This is a checkpoint, not a limitation. |
+| SSO / corporate identity provider | **By design** | Already signed in, same as any other session. |
+| Content behind a subscription you pay for | **By design** | Your account, your session. |
+
+## Walls in the page itself
+
+| Wall | State | Note |
+|---|---|---|
+| Content Security Policy blocks injected script | **By design** | The debugger path does not go through `eval`, so CSP-strict pages (Google Cloud, Stripe, Angular Material) work where script injection is refused. |
+| Content inside an iframe | **By design** | `browser_list_frames` and `browser_select_frame`. |
+| Shadow DOM | **By design** | The click path resolves through shadow roots before dispatching. |
+| React / Vue controlled input that "resets itself" | **Fixed in 1.29.1** | In v1.29.0 `browser_fill` could append instead of replacing. Fixed 2026-09-08: it now reads the field back after clearing it. |
+| Native `<select>` | **Measured** | `browser_select_option`, 9 ms, 2026-09-09. |
+| A `<select>` whose framework stores the value elsewhere | **Fixed in 1.29.1** | In v1.29.0 the guard could call a working choice a rollback. Fixed 2026-09-08: it fingerprints the page and only reports a rollback when nothing else changed. |
+| Custom combobox / autocomplete (div + listbox) | **By design** | `browser_set_combobox` types a prefix, waits for options, clicks the match. |
+| **Custom dropdown that opens on a plain `click`** | **Fixed in 1.29.1** | In v1.29.0 the click fallback fired *two* click events, so anything that toggles opened and closed again. Measured 2026-09-10 in a real page: one click 11\|53\|…\|0 → 11\|69\|…\|1, two clicks unchanged. It now fires one, and judges success by whether the page changed. The tool itself has not been re-run live since. |
+| Date picker | **By design** | `browser_set_date`. |
+| File upload, including drag-and-drop targets | **By design** | `browser_upload_file`, `browser_drop_file`. |
+| Cookie banner or modal in the way | **By design** | `browser_dismiss_overlays`, with a veto list so it never clicks something dangerous. |
+| `alert` / `confirm` freezing the page | **Measured** | `browser_handle_dialog` arms the listener first; a frozen renderer is reported as frozen instead of hanging. |
+| Content that only loads on scroll | **Fixed in 1.29.1** | In v1.29.0 pixel scrolling hit a 30-second timeout on every call, on every page. Fixed 2026-09-09/10: the fallback is now reachable, scrolls to a target position instead of adding a second scroll, and reports failure when it fails. |
+| Page needs a real keystroke, not a synthetic one | **By design** | Debugger key events carry `isTrusted`. |
+| Endless page, need the network to settle | **By design** | `browser_wait_for_network`. |
+
+## Walls we clear partly, and say so
+
+| Wall | State | Note |
+|---|---|---|
+| CAPTCHA | **Partly** | `browser_solve_captcha` tries the checkbox first (often enough when you are signed into Google), then hands the model a screenshot to look at, then asks you. There is no success-rate claim on this page on purpose: we have not measured one, and a number we cannot show the working for is worth nothing. |
+| Anti-automation sites that detach the debugger | **Partly** | The CDP layer re-attaches and retries DOM reads. On main, script evaluations are no longer retried automatically, because some of them click. One known gap remains: `browser_execute_script` still retries your own code on a detach. |
+
+## Walls we will not cross
+
+| Wall | Why not |
+|---|---|
+| Bot-detection systems (Cloudflare, DataDome, fingerprinting) | Browser MCP works because it **is** your browser, not because anything is being circumvented. That sentence is the whole product. Selling evasion would delete it, and it would be an arms race we would lose while promising otherwise. |
+| Accounts that are not yours | The one-time code still lands in an inbox only you control. That boundary is not a technical one. |
+| `chrome://` pages, the extension gallery, `data:` URLs | Chrome forbids scripting them. Not a gap we can close; the tools say so explicitly rather than failing vaguely. |
+| A second Chrome profile | Not supported today. It is a real request, tracked as issue #10. |
+
+## Frequently asked questions
+
+**Does Browser MCP work on sites with a strict Content Security Policy?**
+Partly. The Chrome Debugger API carries most of the work, but `browser_execute_script` cannot run on pages with a strict CSP when the debugger is also unavailable - both string-evaluation paths are blocked, one by the page and one by the extension's own policy. It is written down rather than hidden.
+
+**Does it work headless, or in CI?**
+No, and it never will. The extension drives a real Chrome on a real desktop. For CI, use Playwright MCP - that is what it was built for.
+
+**What happens on a page it cannot handle?**
+It says so. Since 1.29.2 the tools in this class answer one of three things: it landed, it did not land with the reason and the remedy, or it is unknown. They no longer report success because Chrome accepted the command.
+
+## If you hit a wall that is not on this list
+
+Ask your agent to call `browser_provide_feedback`. It checks your install first - an outdated
+copy, or two Browser MCP extensions loaded at once, are both common and both look exactly like
+bugs - and then hands you a pre-filled issue link for whatever is left.
+
+That is not a courtesy line. This table is how the tool gets better: every row in the **Not yet**
+column started as somebody hitting it, and the fastest of them were fixed the same day.

@@ -1,0 +1,557 @@
+/**
+ * Agent360 Browser MCP - Tool Definitions
+ *
+ * Defines all MCP tools exposed to Claude Code.
+ */
+
+export const TOOLS = [
+  {
+    name: 'browser_navigate',
+    description: 'Navigate the active browser tab to a URL. Reuses the current tab by default (no tab spam). Pass new_tab=true only when you need to keep the current page open.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        eget_vindue: { type: 'boolean', description: 'EXPERIMENTAL, requires new_tab. Opens the page in its own unfocused Chrome window instead of a background tab. Whether Chrome delivers mouse and keyboard input in that state is exactly the open question - measure it, do not rely on it.' },
+        url: { type: 'string', description: 'URL to navigate to' },
+        new_tab: { type: 'boolean', description: 'Open in new tab instead of reusing current (default: false)' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'browser_get_page_content',
+    description: 'Get the content of the current page as text or HTML. Pass `selector` to read one part of a large page instead of all of it - on a big logged-in app the full HTML can run past a million characters. The answer is capped at 30000 characters by default and says so when it had to cut, with the real length, so a truncated page is never mistaken for a whole one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        format: { type: 'string', enum: ['text', 'html'], description: 'Output format (default: text)' },
+        selector: { type: 'string', description: 'CSS selector. Reads only that element instead of the whole page. If it matches nothing the call fails rather than silently returning the whole page.' },
+        max_chars: { type: 'number', description: 'Cap on returned characters (default: 30000). Over the cap the answer carries truncated: true and total_chars.' },
+      },
+    },
+  },
+  {
+    name: 'browser_extract_list',
+    description: 'Read EVERY row of a long or virtualised list by scrolling its container until no new rows appear. Use this instead of browser_get_page_content whenever a page shows a repeating list longer than the viewport - mail lists (Outlook, Gmail), invoice/billing tables, search results, transaction histories. Those UIs keep only ~7 rows in the DOM at a time, so a single page read returns a sliver and looks complete. Pass the CSS selector of one repeating row (e.g. \'[role="option"]\', \'tr\', \'[role="listitem"]\'); the scrollable ancestor is found automatically. Returns deduplicated row text plus reached_end so you know whether you saw the whole list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector matching ONE repeating row (e.g. \'[role="option"]\' in Outlook, \'tr\' in a table)' },
+        container: { type: 'string', description: 'Optional CSS selector for the scrollable container. Omit to auto-detect the row\'s nearest scrollable ancestor.' },
+        max_rows: { type: 'number', description: 'Stop after this many unique rows (default 500, max 5000)' },
+        stable_rounds: { type: 'number', description: 'Consecutive scrolls with no new rows before stopping (default 3)' },
+        scroll_step: { type: 'number', description: 'Pixels per scroll. Omit for 85% of the container height.' },
+        wait_ms: { type: 'number', description: 'Wait after each scroll so new rows can render (default 350)' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_screenshot',
+    description: 'Take a screenshot of the visible area of the current tab. Returns base64 PNG, or saves to disk if path is provided.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'File path to save the screenshot to (e.g. /path/to/screenshot.png)' },
+      },
+    },
+  },
+  {
+    name: 'browser_execute_script',
+    description: 'Execute JavaScript in the current page. IMPORTANT: the parameter is `code` (NOT `script` - though that alias is accepted), and it must be an EXPRESSION, not statements: use an IIFE `(() => { ...; return x; })()`. Top-level `return` is a syntax error (the handler wraps code in parentheses).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'JavaScript EXPRESSION to evaluate in page context. For multi-statement logic use an IIFE: (() => { ...; return result; })()' },
+      },
+      required: ['code'],
+    },
+  },
+{
+    name: 'browser_double_click',
+    description: 'True double-click on an element (two trusted press/release pairs with escalating clickCount). Use for open-item actions (calendar events, file lists) where two single clicks would trigger inline-rename instead (e.g. OWA month view).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS or text selector' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_right_click',
+    description: 'Right-click an element (trusted CDP mouse events) to open page-level context menus (web apps like OWA/Google Docs render their own). Note: Chrome\'s NATIVE context menu does not open via CDP - only in-page menus.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS or text selector' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_click_xy',
+    description: 'ESCAPE HATCH: Click at raw viewport coordinates (CSS pixels) with fully trusted mouse events. Use when a visible button resists every selector strategy (Azure portal dialogs, Knockout-bound divs, canvas UIs): take a screenshot, read the button\'s position, click its center. Combine with browser_screenshot for coordinates.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'X coordinate (CSS pixels, from left of viewport)' },
+        y: { type: 'number', description: 'Y coordinate (CSS pixels, from top of viewport)' },
+      },
+      required: ['x', 'y'],
+    },
+  },
+  {
+    name: 'browser_reattach_debugger',
+    description: 'RECOVERY: Force-detach and re-attach the Chrome debugger on the current tab. Use when interactive tools (click/fill/press_key) start timing out or reporting ghost-attach ("Debugger attach failed ... ghost") while list_tabs still works - faster than reloading the extension.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'browser_click',
+    description: 'Click an element on the page. Supports CSS selectors AND text-based selectors. Auto-scrolls element into view. Uses real mouse events (works on Angular/React SPAs and CSP-strict sites like Google, Stripe). Examples: "button:text(Get started)", "text=Submit", "#my-button", "a.btn-primary"',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector or text selector. Text formats: "text=Click me" (any element), "button:text(Submit)" (specific tag)' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_fill',
+    description: 'Fill a form input field with a value. Supports CSS selectors AND text-based selectors. Auto-scrolls and focuses the element. Works on CSP-strict sites via Chrome Debugger API. For date inputs use browser_set_date, for autocomplete/combobox use browser_set_combobox.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector or text selector for the input field' },
+        value: { type: 'string', description: 'Value to fill in' },
+      },
+      required: ['selector', 'value'],
+    },
+  },
+  {
+    name: 'browser_press_key',
+    description: 'Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.). Useful for submitting forms, navigating dropdowns, closing dialogs. Supports modifier keys (ctrl, alt, shift, meta).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Key to press: "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "Backspace", "a", "1", etc.' },
+        code: { type: 'string', description: 'Key code (optional, defaults to key name). E.g. "KeyA" for "a"' },
+        ctrl: { type: 'boolean', description: 'Hold Ctrl/Cmd key' },
+        alt: { type: 'boolean', description: 'Hold Alt key' },
+        shift: { type: 'boolean', description: 'Hold Shift key' },
+        meta: { type: 'boolean', description: 'Hold Meta (Cmd on Mac) key' },
+      },
+      required: ['key'],
+    },
+  },
+  {
+    name: 'browser_scroll',
+    description: 'Scroll the page to an element or by pixel amount. Useful for reaching elements below the fold.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS or text selector to scroll to (element scrolled into center of viewport)' },
+        x: { type: 'number', description: 'Pixels to scroll horizontally (positive = right)' },
+        y: { type: 'number', description: 'Pixels to scroll vertically (positive = down, e.g. 500)' },
+      },
+    },
+  },
+  {
+    name: 'browser_wait',
+    description: 'Wait for an element to appear on the page. Supports CSS and text-based selectors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector or text selector (e.g. "text=Success", "button:text(Next)") to wait for' },
+        timeout: { type: 'number', description: 'Max wait time in ms (default: 10000)' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_hover',
+    description: 'Hover over an element to trigger tooltips, dropdown menus, or hover states. Supports CSS and text selectors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS or text selector to hover over' },
+        duration: { type: 'number', description: 'How long to hold hover in ms (default: 500)' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_select_option',
+    description: 'Select an option from a dropdown menu. Works with native <select> elements AND custom dropdowns (Angular Material, React Select, etc.). For custom dropdowns: clicks the trigger, waits for options, then clicks the matching option by text. For autocomplete (typing filters options) use browser_set_combobox instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS or text selector for the dropdown trigger / <select> element' },
+        option: { type: 'string', description: 'Text OR value of the option to select. Exact value match wins, then exact text, then partial text. Aliases: `value`, `label`. Fails loudly with the available options if nothing matches. A controlled component may reset the field and store the choice elsewhere, so a success can come with `landed: null` and `maybe_landed: true`: the page changed, but the change does not prove it was the selection. Read the page before selecting again.' },
+        wait: { type: 'number', description: 'Ms to wait after clicking trigger for options to appear (default: 300)' },
+      },
+      required: ['selector', 'option'],
+    },
+  },
+  {
+    name: 'browser_dismiss_overlays',
+    description: 'Dismiss visible popups, modals, tooltips, banners, and "Are you sure?"-style overlays in one call. Heuristic-based: finds close affordance via aria-label, text content (Skip/Cancel/Ikke nu/Don\'t show/Got it/Close), or × character button. Use when a flow is interrupted by unexpected dialogs (cookie banners, onboarding tooltips, draft-confirm prompts on Meta Ads, etc.). Returns list of what was dismissed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['non_critical', 'aggressive'], description: 'non_critical (default): skip dialogs containing editable form inputs (preserves user data). aggressive: dismiss everything.' },
+        max_passes: { type: 'number', description: 'Number of dismissal passes (some overlays reveal others when closed). Default: 3' },
+      },
+    },
+  },
+  {
+    name: 'browser_set_combobox',
+    description: 'Set value(s) on an autocomplete/combobox input. Handles the click → type query → wait for filtered listbox → click option flow as one MCP call. Supports multi-select (e.g., Languages on Meta Ads). Use when browser_select_option fails because options render lazily after typing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector for the combobox/autocomplete input' },
+        value: { type: 'string', description: 'Single value to select (use this OR values)' },
+        values: { type: 'array', items: { type: 'string' }, description: 'Array of values for multi-select. E.g. ["Danish", "English", "Swedish"]' },
+        multi: { type: 'boolean', description: 'True if combobox accepts multiple values (chips). Default: auto-detected from presence of values array' },
+        query_chars: { type: 'number', description: 'How many characters to type as filter query (default: 4 or full value length, whichever is smaller)' },
+        wait_ms: { type: 'number', description: 'Max ms to wait for options listbox to appear after typing (default: 3000)' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_drop_file',
+    description: 'Upload a file when browser_upload_file fails. Two strategies: (1) finds a hidden <input type="file"> in the target\'s subtree or up to 2 ancestor levels; (2) if there is no input at all, intercepts the NATIVE OS file-chooser - pass the selector of the button that opens the dialog, and the file is supplied programmatically without the dialog ever appearing. Strategy 2 handles sites like Google Ads that never put a file input in the DOM. Files must be regular files inside the working directory the MCP server runs in - folders, symlinks and hardlinks that point outside it are refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector for the drop-zone target element (e.g. ".upload-area")' },
+        file: { type: 'string', description: 'Single absolute file path. Alias: `file_path`.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Array of absolute file paths' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_set_date',
+    description: 'Robustly set a date input - handles native <input type="date">, masked text inputs (e.g. MM/DD/YYYY), and calendar pickers (MUI, react-datepicker, AntD, Lexical/Meta). Tries native value-set, format-aware typing via Input.insertText, and ARIA-based picker navigation in sequence with read-back verification. Use instead of browser_fill when fill fails or for any input that opens a calendar widget.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector for the date input element' },
+        date: { type: 'string', description: 'ISO date string (YYYY-MM-DD), e.g. "2026-05-15"' },
+        skip_picker: { type: 'boolean', description: 'If true, only try native + masked paths and skip calendar-picker navigation (default: false)' },
+      },
+      required: ['selector', 'date'],
+    },
+  },
+  {
+    name: 'browser_handle_dialog',
+    description: 'Arm automatic handling of the next JavaScript alert/confirm/prompt on the active tab, then return immediately. Call this BEFORE the click that opens the dialog - a dialog freezes the tab, so nothing can be clicked once it is on screen. Pass wait=true only when the dialog is already opening.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['accept', 'dismiss'], description: 'Accept or dismiss the dialog (default: accept)' },
+        text: { type: 'string', description: 'Text to enter for prompt() dialogs' },
+        timeout: { type: 'number', description: 'How long the arming stays active in ms (default: 60000)' },
+        wait: { type: 'boolean', description: 'Block until a dialog appears instead of arming and returning (default: false). Only use when the dialog is already on its way.' },
+      },
+    },
+  },
+  {
+    name: 'browser_wait_for_network',
+    description: 'Wait for a network request to complete. Useful after clicking buttons that trigger API calls - ensures data is loaded before reading the page. Monitors real network traffic via Chrome DevTools Protocol.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_pattern: { type: 'string', description: 'Substring to match in the request URL (e.g. "/api/users", "graphql"). Empty = any request.' },
+        timeout: { type: 'number', description: 'Max wait in ms (default: 15000)' },
+      },
+    },
+  },
+  {
+    name: 'browser_fetch',
+    description: 'Make an HTTP request from the extension background (NOT subject to CORS). Use this when page-context fetch would be blocked by CORS or CSP. Useful for API calls to Google, Stripe, Slack APIs while on their pages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL to fetch' },
+        method: { type: 'string', description: 'HTTP method (default: GET)' },
+        headers: { type: 'object', description: 'Request headers as key-value pairs' },
+        body: { type: 'string', description: 'Request body (for POST/PUT)' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'browser_list_tabs',
+    description: 'List all open browser tabs with their URLs and titles.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'browser_get_cookies',
+    description: 'Get cookies for a site this session has open in one of its tabs (the site itself, a parent domain or a subdomain). Navigate to the site first - cookies for sites the session is not working on are refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        domain: { type: 'string', description: 'Domain to get cookies for (e.g. ".stripe.com"). Must match a tab this session has open.' },
+      },
+      required: ['domain'],
+    },
+  },
+  {
+    name: 'browser_get_local_storage',
+    description: 'Read localStorage from the current page. Pass key for a specific value, or omit for all.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Specific localStorage key to read (omit for all)' },
+      },
+    },
+  },
+  {
+    name: 'browser_set_cookies',
+    description: 'Set one or more cookies for a domain.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Cookie name' },
+        value: { type: 'string', description: 'Cookie value' },
+        domain: { type: 'string', description: 'Cookie domain (e.g. ".example.com")' },
+        url: { type: 'string', description: 'URL for the cookie (alternative to domain)' },
+        path: { type: 'string', description: 'Cookie path (default: /)' },
+        secure: { type: 'boolean', description: 'Secure flag (default: true)' },
+        httpOnly: { type: 'boolean', description: 'HttpOnly flag (default: false)' },
+        sameSite: { type: 'string', enum: ['no_restriction', 'lax', 'strict'], description: 'SameSite attribute (default: lax)' },
+        cookies: { type: 'array', description: 'Array of cookie objects to set multiple at once', items: { type: 'object' } },
+      },
+      required: ['name', 'value'],
+    },
+  },
+  {
+    name: 'browser_set_local_storage',
+    description: 'Set a localStorage key-value pair on the current page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'localStorage key to set' },
+        value: { type: 'string', description: 'Value to store (string)' },
+      },
+      required: ['key', 'value'],
+    },
+  },
+  {
+    name: 'browser_console_logs',
+    description: 'Get recent console.log/warn/error messages from the page. Installs a lightweight interceptor on first call. Returns the last N console messages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        count: { type: 'number', description: 'Number of recent messages to return (default: 50)' },
+      },
+    },
+  },
+  {
+    name: 'browser_ask_user',
+    description: 'Show an overlay dialog asking the user to perform an action or provide information (credentials, 2FA, CAPTCHA, OAuth consent). Can include input fields for the user to fill in. Returns user responses.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'What the user needs to do or provide' },
+        title: { type: 'string', description: 'Dialog title (default: "Agent360 - Action Required")' },
+        fields: {
+          type: 'array',
+          description: 'Input fields for user to fill in. Each field has: name (key), label (display text), type (text/password/email). Omit for simple "Done/Skip" confirmation.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Field key (returned in response)' },
+              label: { type: 'string', description: 'Display label' },
+              type: { type: 'string', enum: ['text', 'password', 'email', 'number'], description: 'Input type (default: text)' },
+            },
+            required: ['name', 'label'],
+          },
+        },
+        timeout: { type: 'number', description: 'Max wait time in ms (default: 120000 = 2 min)' },
+      },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'browser_list_frames',
+    description: 'List all frames (iframes) in the current page with their URLs and indices.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'browser_select_frame',
+    description: 'Execute JavaScript in a specific iframe by frame index. Use browser_list_frames first to find the right index.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        frame_index: { type: 'number', description: 'Frame index from browser_list_frames (0 = main frame)' },
+        code: { type: 'string', description: 'JavaScript to execute in the frame (default: returns text content)' },
+      },
+      required: ['frame_index'],
+    },
+  },
+  {
+    name: 'browser_get_new_tab',
+    description: 'Get the most recently opened tab (useful after clicking links that open new tabs, OAuth popups, etc.).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'browser_switch_tab',
+    description: 'Switch to a specific browser tab by ID. Get tab IDs from browser_list_tabs or browser_get_new_tab.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab_id: { type: 'number', description: 'Tab ID to activate' },
+      },
+      required: ['tab_id'],
+    },
+  },
+  {
+    name: 'browser_close_tab',
+    description: 'Close a browser tab by ID. Only tabs owned by the current session can be closed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab_id: { type: 'number', description: 'Tab ID to close (get from browser_list_tabs)' },
+      },
+      required: ['tab_id'],
+    },
+  },
+  {
+    name: 'browser_upload_file',
+    description: 'Upload a file to a <input type="file"> element on the page. Uses Chrome Debugger API to set files programmatically - no dialog needed. For drag-drop zones without visible file input use browser_drop_file. Files must be regular files inside the working directory the MCP server runs in - folders, symlinks and hardlinks that point outside it are refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector for the file input (default: input[type="file"])' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Array of absolute file paths to upload. E.g. ["/Users/me/photo.jpg"]' },
+        file: { type: 'string', description: 'Single file path (alternative to files array). Alias: `file_path`.' },
+      },
+      required: ['files'],
+    },
+  },
+  {
+    name: 'browser_extract_token',
+    description: 'Navigate to a provider\'s API settings page so you can read its API token from the page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        provider: { type: 'string', description: 'Provider slug (stripe, hubspot, slack, etc.)' },
+      },
+      required: ['provider'],
+    },
+  },
+  {
+    name: 'browser_solve_captcha',
+    description: 'Detect and solve CAPTCHAs on the current page. Auto-detects reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile, and FunCaptcha. Tries auto-click first (often clears reCAPTCHA v2 when signed into Google), then returns a screenshot for AI vision analysis, then falls back to asking the user. Returns detection info and solving status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['detect', 'click_checkbox', 'click_grid', 'ask_human'], description: 'Action to take. "detect" scans for CAPTCHAs. "click_checkbox" clicks the reCAPTCHA checkbox. "click_grid" clicks specific grid cells (pass cells param). "ask_human" shows overlay to user. Default: "detect"' },
+        cells: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Grid cell indices to click (0-indexed, left-to-right, top-to-bottom) for image challenges. E.g. [2, 5, 7] to click cells 3, 6, 8.',
+        },
+      },
+    },
+  },
+  {
+    name: 'browser_about',
+    description: 'Returns Browser MCP info and pre-filled URLs the user can click to submit feature wishes, share use-cases, or report bugs. Call this PROACTIVELY whenever the user (a) mentions a feature they wish existed ("I wish browser-mcp could...", "it would be nice if..."), (b) says something is missing, broken, or unexpected, (c) asks how Browser MCP works or who maintains it, or (d) describes something cool they built with browser-mcp. Pass intent="wish" | "use_case" | "bug" | "info" plus an optional title and body, and offer the returned submit_url to the user. Browser MCP is community-shaped - this tool is how the user contributes back.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        intent: {
+          type: 'string',
+          enum: ['wish', 'use_case', 'bug', 'info'],
+          description: 'What the user wants to share. "wish" = feature request, "use_case" = share what they built, "bug" = something broken, "info" = general (default: "info").',
+        },
+        title: {
+          type: 'string',
+          description: 'Optional pre-filled issue title (e.g. "Support hCaptcha v3"). Will be URL-encoded into the submit link.',
+        },
+        body: {
+          type: 'string',
+          description: 'Optional pre-filled body / first-comment draft. Will be URL-encoded into the submit link. Keep it short; user can expand on GitHub.',
+        },
+      },
+    },
+  },
+  {
+    name: 'browser_provide_feedback',
+    description: 'Self-diagnosis + feedback in one call. Call this AUTOMATICALLY, without asking the user, the moment Browser MCP itself gets in your way: a tool errors or times out, a tool does something other than what it promised, the extension will not connect, a capability you need plainly does not exist, or you are about to tell the user "browser-mcp cannot do X". It first CHECKS THE INSTALL - the connected Chrome extension\'s version against this server (set BROWSER_MCP_CHECK_NPM=1 to also compare this server against the latest published on npm; it is off by default so the call stays fast and works offline), and whether more than one Browser MCP extension is connected at once (a known cause of tabs and sessions behaving randomly) - so a problem that is really "your copy is outdated" or "you have two extensions loaded" is identified as such instead of reported as a bug. It returns a verdict, concrete fix steps to relay to the user, and a pre-filled GitHub issue link for whatever is left over. Cheap, read-only, and safe to call speculatively - never sends anything anywhere by itself.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        what_happened: {
+          type: 'string',
+          description: 'Required. What you tried and what actually happened, in one or two plain sentences. Include the exact error text if there was one.',
+        },
+        kind: {
+          type: 'string',
+          enum: ['blocked', 'broken', 'missing', 'wish', 'use_case'],
+          description: '"blocked" = you could not complete the task (default). "broken" = a tool misbehaved or lied about its result. "missing" = the capability does not exist. "wish" = a feature idea. "use_case" = something worth sharing that you built.',
+        },
+        tool: {
+          type: 'string',
+          description: 'The browser_* tool involved, e.g. "browser_click". Omit if none in particular.',
+        },
+        url: {
+          type: 'string',
+          description: 'The page it happened on, if relevant. Strip query strings that contain tokens.',
+        },
+        attempted: {
+          type: 'string',
+          description: 'What you already tried (other selectors, other tools, retries) so the report does not suggest what you have ruled out.',
+        },
+      },
+      required: ['what_happened'],
+    },
+  },
+];
+
+// Known provider token pages for browser_extract_token
+export const PROVIDER_PAGES = {
+  stripe: {
+    url: 'https://dashboard.stripe.com/apikeys',
+    instructions: 'Look for the Secret key starting with sk_live_ or sk_test_',
+  },
+  hubspot: {
+    url: 'https://app.hubspot.com/settings/',
+    instructions: 'Navigate to Integrations → Private Apps → create or find existing app → Access Token',
+  },
+  slack: {
+    url: 'https://api.slack.com/apps',
+    instructions: 'Select app → OAuth & Permissions → Bot User OAuth Token (xoxb-...)',
+  },
+  shopify: {
+    url: 'https://admin.shopify.com/store/',
+    instructions: 'Settings → Apps → Develop apps → find app → Admin API access token',
+  },
+  mailchimp: {
+    url: 'https://us1.admin.mailchimp.com/account/api/',
+    instructions: 'Look for the API key or create a new one',
+  },
+  pipedrive: {
+    url: 'https://app.pipedrive.com/settings/api',
+    instructions: 'Copy the personal API token shown on the page',
+  },
+  calendly: {
+    url: 'https://calendly.com/integrations/api_webhooks',
+    instructions: 'Copy the personal access token or generate a new one',
+  },
+  google: {
+    url: 'https://console.cloud.google.com/apis/credentials',
+    instructions: 'Find or create an API key / OAuth client',
+  },
+  linkedin: {
+    url: 'https://www.linkedin.com/developers/apps',
+    instructions: 'Select app → Auth → Client credentials',
+  },
+};

@@ -1,0 +1,157 @@
+name: dominans-audit
+
+# Monthly, model-free distribution + competition watch for Browser MCP by Agent360.
+# Runs entirely on GitHub's infrastructure (no AI vendor, no machine to keep awake).
+#
+# Two signals, deliberately:
+#   1. A monthly ISSUE with the full report - so the run reaches a human every month,
+#      including the reminder to run the manual AI-citations panel. Without this, a
+#      green month is silent and the reminder never lands.
+#   2. A FAILED run on any 🔴 finding (registry drift, catalog regression, or the dead
+#      twin browsermcp.io resurrecting) - GitHub emails the repo owner.
+#
+# Manual run any time from the Actions tab (workflow_dispatch).
+
+on:
+  schedule:
+    - cron: "0 7 1 * *"   # 1st of each month, 07:00 UTC = 09:00 Europe/Copenhagen
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    # If these secrets are set, the monthly report is emailed and no issue is created.
+    # If they are not, the workflow falls back to posting the issue (see steps below),
+    # so it keeps working whether or not SendGrid is wired up yet.
+    env:
+      SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+      SENDGRID_FROM_EMAIL: ${{ secrets.SENDGRID_FROM_EMAIL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run dominans-audit
+        id: audit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          python3 scripts/dominans-audit.py | tee /tmp/audit-report.txt
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+
+      # Konkurrent-vagten koeres i SAMME maanedlige job, ikke som en egen arbejdsgang -
+      # ellers kommer der to mails om den samme maaned. Findes fordi 19/9-2026: ni sider paa
+      # browsermcp.dev paastod noget forkert om Microsofts Playwright MCP i ti dage, fordi
+      # intet gen-laeste deres dokumentation. Den pinner MAENGDEN af deres vaerktoejer, saa
+      # et nyt vaerktoej hos dem - fx ét der kan standse og spoerge mennesket - goer runden
+      # roed. Det er samtidig doedsvarslet paa vores eneste tilbagevaerende position.
+      - name: Konkurrent-vagt
+        id: vagt
+        run: |
+          set +e
+          {
+            echo
+            echo "=== KONKURRENT-VAGT ==="
+          } >> /tmp/audit-report.txt
+          python3 scripts/konkurrent-vagt.py 2>&1 | tee -a /tmp/audit-report.txt
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+
+      # Preferred delivery: email via SendGrid. Runs only when the key is configured,
+      # so the report reaches a human every month (green nudge or red alarm) without
+      # creating a GitHub issue to close.
+      - name: Email monthly report (SendGrid)
+        if: always() && env.SENDGRID_API_KEY != ''
+        env:
+          AUDIT_STATUS: ${{ steps.audit.outputs.status }}
+          # MAALT 19/9: her stod kun AUDIT_STATUS. Var konkurrent-vagten roed og auditen
+          # groen, sagde emnefeltet "maanedstjek OK" mens rapporten under den var roed.
+          # Et falsk groent er praecis den fejlklasse vagten findes for.
+          VAGT_STATUS: ${{ steps.vagt.outputs.status }}
+          MAIL_TO: gustav@agent360.dk
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request
+          green = (os.environ.get("AUDIT_STATUS", "0") == "0"
+                   and os.environ.get("VAGT_STATUS", "0") == "0")
+          report = open("/tmp/audit-report.txt", encoding="utf-8").read()
+          subject = ("✅ Browser MCP - månedstjek OK (husk citations-måling)" if green
+                     else "\U0001F534 Browser MCP - handling påkrævet (drift fundet)")
+          citations_kit = (
+              "─────────────────────────────────────────\n"
+              "AI-CITATIONS - den ene ting der ikke kan køre automatisk\n"
+              "─────────────────────────────────────────\n"
+              "Den kræver din indloggede browser (ChatGPT/Perplexity/Claude kan ikke\n"
+              "køres headless). Åbn hver, indsæt prompten, notér om browsermcp.dev\n"
+              "nævnes/citeres - verificér ejerskab via URL (browsermcp.dev = os,\n"
+              "browsermcp.io = tvillingen). Læs ChatGPT via screenshot, ikke kopieret tekst.\n\n"
+              "Kør disse 6 (15 min):\n"
+              "  1. best MCP server for browser automation\n"
+              "  2. which MCP server should I use to control Chrome from Claude Code?\n"
+              "  3. MCP server that uses my real logged-in browser instead of headless\n"
+              "  4. is browsermcp.io still maintained?\n"
+              "  5. Browser MCP vs BrowserMCP.io\n"
+              "  6. alternatives to Playwright MCP for browser automation\n\n"
+              "Baseline at slå (21-24/7): ChatGPT rangerede os #2 på USP-prompten og\n"
+              "citerede browsermcp.dev; Perplexity 0/2 (mcp-chrome vandt vores USP).\n"
+              "Notér resultater i: plans/SEO/research/citations-run-<dato>.md\n"
+              "Vil du have målingen KØRT for dig: bed en Claude-chat med browser-mcp\n"
+              "drive den i din browser (kan ikke automatiseres via denne cron).\n"
+              "─────────────────────────────────────────\n\n")
+          intro = ("Månedstjekket for browsermcp.dev kørte - ingen drift eller regression.\n\n"
+                   + citations_kit
+                   if green else
+                   "Månedstjekket for browsermcp.dev fandt et problem - se rapporten nedenfor.\n\n")
+          payload = {
+              "personalizations": [{"to": [{"email": os.environ["MAIL_TO"]}]}],
+              "from": {"email": os.environ["SENDGRID_FROM_EMAIL"]},
+              "subject": subject,
+              "content": [{"type": "text/plain", "value": intro + report}],
+          }
+          req = urllib.request.Request(
+              "https://api.sendgrid.com/v3/mail/send",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Authorization": "Bearer " + os.environ["SENDGRID_API_KEY"],
+                       "Content-Type": "application/json"},
+              method="POST")
+          with urllib.request.urlopen(req) as r:
+              print("SendGrid accepted:", r.status)
+          PY
+
+      # Fallback delivery: post an issue, but ONLY when SendGrid is not configured,
+      # so we never double-notify once email is wired up.
+      - name: Post monthly report as an issue (fallback)
+        if: always() && env.SENDGRID_API_KEY == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MONTH=$(date -u +'%Y-%m')
+          {
+            echo "Automated monthly distribution + competition watch for browsermcp.dev."
+            echo "Model-free: a plain script on GitHub's schedule, no AI vendor involved."
+            echo
+            echo '```'
+            cat /tmp/audit-report.txt
+            echo '```'
+            echo
+            echo "_Close this issue once read. Next run: 1st of next month, 09:00 Europe/Copenhagen._"
+          } > /tmp/issue-body.md
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Dominans-audit - $MONTH" \
+            --body-file /tmp/issue-body.md
+
+      - name: Fail the run if the audit or the guard found a 🔴
+        if: steps.audit.outputs.status != '0' || steps.vagt.outputs.status != '0'
+        run: |
+          if [ "${{ steps.audit.outputs.status }}" != "0" ]; then
+            echo "::error::dominans-audit reported a 🔴 finding - see the report (email or issue)"
+          fi
+          if [ "${{ steps.vagt.outputs.status }}" != "0" ]; then
+            echo "::error::konkurrent-vagten er roed - en paastand paa vores sider kan vaere blevet usand. Ret siderne, koer scripts/konkurrent-vagt.py --pin"
+          fi
+          exit 1

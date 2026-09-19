@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+# generate-docs.py - regenerates the /docs and /compare HTML pages on browsermcp.dev
+# from their markdown sources in content/. The committed HTML under docs/ is BUILD OUTPUT:
+# never hand-edit it - edit the markdown source (or this generator) and re-run:
+#   python3 scripts/generate-docs.py
+# Output is deterministic; a clean run leaves `git status` unchanged.
+import re, html, os, json, datetime, pathlib, subprocess
+
+REPO=os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','docs')+os.sep  # site root (build output)
+DRAFTS=os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','content')+os.sep  # markdown sources
+OG='https://browsermcp.dev/og-image.jpg'
+PAGES=[
+ ('browsermcp-docs-install-claude-code.md','Docs','Claude Code','/docs/install-claude-code'),
+ ('browsermcp-docs-install-codex.md','Docs','Codex','/docs/install-codex'),
+ ('browsermcp-docs-install-cursor.md','Docs','Cursor','/docs/install-cursor'),
+ ('browsermcp-docs-install-vscode.md','Docs','VS Code','/docs/install-vscode'),
+ ('browsermcp-docs-install-cline.md','Docs','Install for Cline','/docs/install-cline'),
+ ('browsermcp-docs-install-gemini-cli.md','Docs','Install for Gemini CLI','/docs/install-gemini-cli'),
+ ('browsermcp-docs-install-copilot.md','Docs','Install for Copilot','/docs/install-copilot'),
+ ('browsermcp-docs-install-zed.md','Docs','Install for Zed','/docs/install-zed'),
+ ('browsermcp-docs-install-kiro.md','Docs','Install for Kiro','/docs/install-kiro'),
+ ('browsermcp-docs-install-windsurf.md','Docs','Install for Windsurf','/docs/install-windsurf'),
+ ('browsermcp-docs-install-continue.md','Docs','Install for Continue.dev','/docs/install-continue'),
+ ('browsermcp-docs-install-zcode.md','Docs','ZCode','/docs/install-zcode'),
+ ('browsermcp-docs-what-is-browser-mcp.md','Docs','What is Browser MCP','/docs/what-is-browser-mcp'),
+ ('browsermcp-docs-tools.md','Docs','Tools','/docs/tools'),
+ ('browsermcp-docs-uninstall.md','Docs','Uninstall & data','/docs/uninstall'),
+ ('browsermcp-docs-when-not-to-use.md','Docs','When NOT to use','/docs/when-not-to-use'),
+ ('browsermcp-docs-capability-matrix.md','Docs','What it can get past','/docs/capability-matrix'),
+ ('browsermcp-docs-troubleshooting.md','Docs','Troubleshooting','/docs/troubleshooting'),
+ ('browsermcp-migrate-from-browsermcp-io.md','Compare','Migrate from browsermcp.io','/migrate/from-browsermcp-io'),
+ ('browsermcp-compare-browsermcp-io.md','Compare','vs browsermcp.io','/compare/browsermcp-io'),
+ ('browsermcp-compare-playwright-mcp.md','Compare','vs Playwright MCP','/compare/playwright-mcp'),
+ ('browsermcp-compare-mcp-servers.md','Compare','All servers compared','/compare/browser-automation-mcp-servers'),
+ ('browsermcp-compare-mcp-chrome.md','Compare','vs mcp-chrome','/compare/mcp-chrome'),
+ ('browsermcp-usecase-claude-code-loginvaeg.md','Use cases','Claude Code + login wall','/use-cases/claude-code-login-wall'),
+ ('browsermcp-usecase-cursor-captcha.md','Use cases','Cursor + CAPTCHA','/use-cases/cursor-captcha'),
+ ('browsermcp-usecase-vscode-samtidige.md','Use cases','VS Code + concurrent sessions','/use-cases/vscode-concurrent-sessions'),
+ ('browsermcp-usecase-codex-2fa.md','Use cases','Codex + 2FA','/use-cases/codex-2fa'),
+ ('browsermcp-usecase-2fa-gmail.md','Use cases','Read a 2FA code from Gmail','/use-cases/read-2fa-from-gmail'),
+ ('browsermcp-usecase-concurrent-sessions.md','Use cases','Concurrent sessions','/use-cases/concurrent-sessions'),
+ ('browsermcp-learn-model-context-protocol.md','Learn','Model Context Protocol','/learn/model-context-protocol'),
+ ('browsermcp-learn-what-is-an-mcp-server.md','Learn','What is an MCP server','/learn/what-is-an-mcp-server'),
+ ('browsermcp-learn-check-ai-mentions-brand.md','Learn','Check if AI mentions you','/learn/check-if-ai-mentions-your-brand'),
+ ('browsermcp-learn-react-controlled-forms.md','Learn','Automating React forms','/learn/browser-automation-react-forms'),
+ ('browsermcp-learn-tools-that-lie.md','Learn','Tools that said yes','/learn/tools-that-lie'),
+]
+
+# Antallet af vaerktoejer udledes af kilden. Stod det haardkodet her, paastod hver
+# eneste genererede side "34 browser tools" laenge efter at der var 43 - og
+# check-docs.py faldt paa det ved hver eneste koersel.
+TOOL_COUNT=len(set(re.findall(r"name:\s*['\"](browser_[a-z0-9_]+)['\"]",
+    (pathlib.Path(__file__).resolve().parent.parent/'mcp-server'/'tools.js').read_text(encoding='utf-8'))))
+
+INSTALL=['/docs/install-claude-code','/docs/install-codex','/docs/install-cursor','/docs/install-vscode','/docs/install-zcode']
+CTX={'/docs/what-is-browser-mcp':'The concept, architecture, and how it works',
+ '/docs/tools':f'Full reference for all {TOOL_COUNT} browser tools',
+ '/compare/browsermcp-io':'How it differs from the similarly-named browsermcp.io',
+ '/docs/install-claude-code':'Add Browser MCP to Claude Code','/docs/install-codex':'Add Browser MCP to OpenAI Codex',
+ '/docs/install-cursor':'Add Browser MCP to Cursor','/docs/install-vscode':'Add Browser MCP to VS Code agent mode',
+ '/docs/install-zcode':'Add Browser MCP to z.ai ZCode',
+ '/docs/capability-matrix':'Every wall, and whether we clear it',
+ '/docs/uninstall':'Full removal + every permission explained','/docs/when-not-to-use':'When another tool is the right choice','/docs/troubleshooting':'Real bugs, causes and fixes',
+ '/compare/playwright-mcp':'Real logged-in Chrome vs managed profiles','/compare/browser-automation-mcp-servers':'The full field, compared and dated','/compare/mcp-chrome':'The closest equivalent - and its activity gap',
+ '/use-cases/read-2fa-from-gmail':'The move headless browsers can\'t make','/use-cases/concurrent-sessions':'Several agents in one Chrome, isolated',
+ '/learn/model-context-protocol':'The standard, explained plainly','/learn/what-is-an-mcp-server':'What a server is and how to pick one',
+ '/learn/check-if-ai-mentions-your-brand':'Measure your visibility in AI answers','/learn/browser-automation-react-forms':'Why value-setting fails, and the fix',
+ '/learn/tools-that-lie':'Nine tools that reported success without doing anything'}
+def front_matter(md):
+    # optional leading '---' block of 'key: value' lines; a future publish_date holds a page back until that date
+    if md.startswith('---\n'):
+        end=md.find('\n---',4)
+        if end!=-1:
+            fm={}
+            for ln in md[4:end].split('\n'):
+                if ':' in ln: k,v=ln.split(':',1); fm[k.strip()]=v.strip()
+            return fm, md[end+4:].lstrip('\n')
+    return {}, md
+
+TODAY=datetime.date.today().isoformat()
+SOURCES={}; LIVE=[]
+for _fn,_grp,_label,_url in PAGES:
+    _fm,_body=front_matter(open(DRAFTS+_fn).read())
+    if _fm.get('publish_date','')>TODAY:
+        print('  %-32s scheduled %s - held back' % (_url,_fm['publish_date']))
+        continue
+    SOURCES[_url]=_body; LIVE.append((_fn,_grp,_label,_url))
+LABELS={url:label for _,_,label,url in LIVE}
+# <title> overrides (SEO length fixes applied directly to the tag; H1/og:title keep the draft's long form)
+TITLE_TAG={'/compare/browsermcp-io':'Browser MCP vs. browsermcp.io - which is maintained? (2026)',
+ '/compare/browser-automation-mcp-servers':'Best Browser Automation MCP Servers (2026) - Compared',
+ '/docs/install-claude-code':'Browser MCP for Claude Code - Give Claude Your Real, Logged-In Chrome',
+ '/compare/playwright-mcp':'Browser MCP vs Playwright MCP (2026): Logged-In vs Headless',
+ '/compare/mcp-chrome':'Browser MCP vs mcp-chrome (2026): Is mcp-chrome Still Maintained?',
+ '/docs/uninstall':'Uninstall Browser MCP + Exactly What Data It Touches (2026)',
+ '/docs/when-not-to-use':'When NOT to Use Browser MCP (Honest Guide, 2026)',
+ '/docs/troubleshooting':'Browser MCP Troubleshooting: Real Bugs, Real Fixes (2026)',
+ '/use-cases/read-2fa-from-gmail':'How an AI Agent Reads a 2FA Code From Gmail Mid-Login (Browser MCP)',
+ '/use-cases/concurrent-sessions':'Run Multiple AI Agent Sessions in One Chrome (Browser MCP)',
+ '/learn/model-context-protocol':'Model Context Protocol (MCP), Explained Simply (2026)',
+ '/learn/what-is-an-mcp-server':'What Is an MCP Server? A Practical Explanation (2026)',
+ '/learn/check-if-ai-mentions-your-brand':'How to Check if ChatGPT & Perplexity Mention Your Brand (2026)',
+ '/learn/browser-automation-react-forms':'Why Browser Automation Fails on React Forms (And How to Fix It)',
+ '/learn/tools-that-lie':'Nine Browser Tools That Reported Success Without Doing Anything'}
+def related(url):
+    if url=='/docs/what-is-browser-mcp': links=INSTALL+['/docs/tools','/compare/browsermcp-io']
+    elif url in INSTALL: links=['/docs/what-is-browser-mcp','/docs/tools','/compare/browsermcp-io']+[u for u in INSTALL if u!=url][:2]
+    elif url=='/docs/tools': links=['/docs/install-claude-code','/docs/what-is-browser-mcp','/compare/browsermcp-io']
+    else: links=['/docs/install-claude-code','/docs/what-is-browser-mcp','/docs/tools']
+    links=[u for u in links if u in LABELS]
+    lis=''.join('<li><a href="%s/">%s</a><span>%s</span></li>'%(u,html.escape(LABELS.get(u,u)),html.escape(CTX.get(u,''))) for u in links)
+    return '<div class="related"><h2>Related</h2><ul>'+lis+'</ul></div>'
+
+def inline(t):
+    t=html.escape(t,quote=False)
+    t=re.sub(r'`([^`]+)`',r'<code>\1</code>',t); t=re.sub(r'\*\*([^*]+)\*\*',r'<b>\1</b>',t)
+    t=re.sub(r'(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)',r'<i>\1</i>',t)
+    # Sitet serverer hver side paa en adresse der ender paa skraastreg; uden den svarer
+    # serveren 301 og sender laeser og crawler et ekstra hop. Maalt 8/9-2026: 18 links paa
+    # 22 sider ramte forbi. "Related"-blokken nedenfor har altid haft skraastregen -
+    # markdown-links fra kildefilerne kom aldrig forbi den, og det var halvdelen af fejlen.
+    def _sti(m):
+        tekst, adr = m.group(1), m.group(2)
+        if adr.startswith('/') and '.' not in adr.split('/')[-1].split('#')[0]:
+            sti, _, anker = adr.partition('#')
+            if not sti.endswith('/'):
+                adr = sti + '/' + (('#' + anker) if anker else '')
+        return '<a href="%s">%s</a>' % (adr, tekst)
+    t=re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _sti, t); return t
+def strip_md(t):
+    t=re.sub(r'`([^`]+)`',r'\1',t); t=re.sub(r'\*\*([^*]+)\*\*',r'\1',t)
+    t=re.sub(r'\*([^*\n]+)\*',r'\1',t)
+    t=re.sub(r'\[([^\]]+)\]\([^)]+\)',r'\1',t); return t.strip()
+def clean_lines(md):
+    lines=md.split('\n')
+    while lines and lines[0].strip().startswith('//'): lines.pop(0)
+    while lines and lines[0].strip()=='': lines.pop(0)
+    NOTE=re.compile(r'Suggested (URL|title|meta)|Last verified:', re.I)
+    lines=[x for x in lines if not NOTE.search(x)]
+    while lines and lines[0].strip()=='': lines.pop(0)
+    return lines
+def split_tabelrække(linje):
+    """Deler en markdown-tabelrække paa | og respekterer escapet \\|.
+
+    MAALT 13/9 af Astra: raekken "Custom dropdown that opens on a plain click" i
+    capability-matrix indeholder en maaling skrevet som 11\\|53\\|...\\|0. Et bart split('|')
+    hakkede den i ni celler i en tabel med tre kolonner, saa den laa i stykker paa den
+    offentlige side - med synlige backslashes - fra 10/9. Docs-spaerren saa det ikke,
+    fordi den sammenligner genereret output med sig selv og ikke tjekker tabelform.
+    """
+    celler = [];  aktuel = '';  i = 0
+    while i < len(linje):
+        if linje[i] == '\\' and i + 1 < len(linje) and linje[i+1] == '|':
+            aktuel += '|'; i += 2; continue
+        if linje[i] == '|':
+            celler.append(aktuel); aktuel = ''; i += 1; continue
+        aktuel += linje[i]; i += 1
+    celler.append(aktuel)
+    return [c.strip() for c in celler]
+
+def md_to_html(lines):
+    out=[];i=0;n=len(lines)
+    while i<n:
+        line=lines[i]
+        if line.strip().startswith('```'):
+            i+=1;code=[]
+            while i<n and not lines[i].strip().startswith('```'): code.append(lines[i]);i+=1
+            i+=1;out.append('<div class="code"><pre>'+html.escape('\n'.join(code))+'</pre><button class="copy">Copy</button></div>');continue
+        if '|' in line and i+1<n and re.match(r'^\s*\|?[\s:|-]+\|?\s*$',lines[i+1]) and '-' in lines[i+1]:
+            hd=split_tabelrække(line.strip().strip('|'));i+=2;rows=[]
+            while i<n and '|' in lines[i] and lines[i].strip(): rows.append(split_tabelrække(lines[i].strip().strip('|')));i+=1
+            t='<div class="scroll"><table><tr>'+''.join('<th>%s</th>'%inline(h) for h in hd)+'</tr>'
+            for r in rows: t+='<tr>'+''.join('<td>%s</td>'%inline(c) for c in r)+'</tr>'
+            out.append(t+'</table></div>');continue
+        m=re.match(r'^(#{1,4})\s+(.*)$',line)
+        if m:
+            # GitHub-style slug so in-page links like [x](#some-heading) resolve. Sources
+            # already used such links; without ids they silently did nothing.
+            lvl=len(m.group(1)); txt=m.group(2)
+            slug=re.sub(r'[^a-z0-9 -]','',strip_md(txt).lower()).strip().replace(' ','-')
+            slug=re.sub(r'-+','-',slug).strip('-')  # collapse runs left by dashes in the title
+            out.append('<h%d id="%s">%s</h%d>'%(lvl,slug,inline(txt),lvl));i+=1;continue
+        if re.match(r'^\s*---+\s*$',line): out.append('<hr>');i+=1;continue
+        if line.strip().startswith('>'):
+            bq=[]
+            while i<n and lines[i].strip().startswith('>'): bq.append(lines[i].strip().lstrip('>').strip());i+=1
+            out.append('<blockquote>'+inline(' '.join(bq))+'</blockquote>');continue
+        if re.match(r'^\s*[-*]\s+',line) or re.match(r'^\s*\d+\.\s+',line):
+            ordered=bool(re.match(r'^\s*\d+\.\s+',line));items=[]
+            while i<n and (re.match(r'^\s*[-*]\s+',lines[i]) or re.match(r'^\s*\d+\.\s+',lines[i])):
+                items.append('<li>'+inline(re.sub(r'^\s*(?:[-*]|\d+\.)\s+','',lines[i]))+'</li>');i+=1
+            tag='ol' if ordered else 'ul';out.append('<%s>%s</%s>'%(tag,''.join(items),tag));continue
+        if line.strip()=='': i+=1;continue
+        para=[line];i+=1
+        while i<n and lines[i].strip() and not re.match(r'^(#{1,4}\s|```|>|\s*[-*]\s|\s*\d+\.\s|\s*---+\s*$)',lines[i]) and '|' not in lines[i]: para.append(lines[i]);i+=1
+        out.append('<p>'+inline(' '.join(para))+'</p>')
+    return '\n'.join(out)
+def title_of(lines):
+    for l in lines:
+        m=re.match(r'^#\s+(.*)$',l)
+        if m: return strip_md(m.group(1))
+    return 'Browser MCP'
+def meta_desc(lines, raw=''):
+    # A source may state its own meta description in the front-matter line
+    # (*Suggested ... meta description: "..."*). Honour it - it is hand-written for
+    # search snippets, and clean_lines() has already dropped that line from `lines`,
+    # so it must be read from the raw source. Otherwise fall back to the first real
+    # paragraph after the H1 (which is whatever the page happens to open with).
+    m = re.search(r'meta description:\s*"(.*?)"', raw, re.S)
+    if m:
+        d = ' '.join(m.group(1).split())
+        if len(d) > 60:
+            return (d[:152].rsplit(' ', 1)[0] + '…') if len(d) > 155 else d
+    started=False; in_code=False
+    for l in lines:
+        s=l.strip()
+        if s.startswith('```'): in_code = not in_code; continue
+        if in_code: continue
+        if re.match(r'^#\s',l): started=True; continue
+        if not started: continue
+        if not s or s.startswith(('#','>','|','-','*')) or re.match(r'^\d+\.',s): continue
+        d=strip_md(s)
+        if len(d)>60: return (d[:152].rsplit(' ',1)[0]+'…') if len(d)>155 else d
+    return 'Browser MCP - give your AI agent a real, already-logged-in Chrome.'
+def extract_faq(lines):
+    # find ## FAQ section, parse **Q?** + answer
+    faq=[];in_faq=False;q=None;a=[]
+    for l in lines:
+        if re.match(r'^##\s',l):
+            if in_faq and q: faq.append((q,' '.join(a).strip())); q=None;a=[]
+            in_faq = bool(re.search(r'FAQ|Ofte stillede|Frequently', l, re.I))
+            continue
+        if not in_faq: continue
+        m=re.match(r'^\*\*(.+?)\*\*\s*$', l.strip())
+        if m:
+            if q: faq.append((q,' '.join(a).strip()))
+            q=strip_md(m.group(1)); a=[]
+        elif l.strip() and q:
+            a.append(strip_md(l.strip()))
+    if q: faq.append((q,' '.join(a).strip()))
+    return [(qq,aa) for qq,aa in faq if qq.endswith('?') and aa]
+
+# Sider vi bevidst holder UDE af Googles indeks. MAALT 19/9: den ene her fik 416
+# visninger og NUL klik paa en maaned, gennemsnitsposition 77,5, og traekker et helt
+# klynge-emne om brand-omtaler i Perplexity som intet har med produktet at goere.
+# Paa et 22-siders domaene er det emne-fortynding: den fortaeller Google at sitet
+# ogsaa handler om noget andet. 'follow' beholdes, saa dens links stadig taeller.
+# En side her SKAL vaere ude af sitemap.xml - check-docs haandhaever begge veje.
+NOINDEX = {'/learn/check-if-ai-mentions-your-brand'}
+
+def head(title, desc, url):
+    can='https://browsermcp.dev'+url+'/'
+    t=html.escape(title); d=html.escape(desc)
+    h=['<meta charset="utf-8">','<meta name="viewport" content="width=device-width,initial-scale=1">',
+      (('<title>%s</title>'%html.escape(TITLE_TAG[url])) if url in TITLE_TAG else ('<title>%s &middot; Browser MCP</title>'%t)),
+      '<meta name="description" content="%s">'%d,
+      '<link rel="canonical" href="%s">'%can,
+      *(['<meta name="robots" content="noindex,follow">'] if url in NOINDEX else []),
+      '<link rel="icon" type="image/svg+xml" href="/logo.svg"><link rel="icon" type="image/x-icon" href="/favicon.ico">',
+      '<meta property="og:type" content="article"><meta property="og:site_name" content="Browser MCP">',
+      '<meta property="og:title" content="%s">'%t,'<meta property="og:description" content="%s">'%d,
+      '<meta property="og:url" content="%s">'%can,
+      '<meta property="og:image" content="%s"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">'%OG,
+      '<meta name="twitter:card" content="summary_large_image">','<meta name="twitter:title" content="%s">'%t,
+      '<meta name="twitter:description" content="%s">'%d,'<meta name="twitter:image" content="%s">'%OG,
+      '<link rel="stylesheet" href="/assets/docs.css">']
+    return '\n'.join(h)
+
+# Datoer til TechArticle og sitemap udledes af kildefilens historik. Uden dem skrev
+# generatoren INGEN dato, og haandindsatte datoer forsvandt ved hver koersel - det skete
+# 8/9-2026, hvor 20 sider mistede deres datePublished og sitemappets lastmod ved en
+# regenerering. Nu er de udledt, saa de overlever og altid passer til indholdet.
+_DATO_CACHE = {}
+def git_datoer(fn):
+    """(foerste commit, seneste commit) for en kildefil, som YYYY-MM-DD."""
+    if fn in _DATO_CACHE: return _DATO_CACHE[fn]
+    sti = os.path.join(DRAFTS, fn)
+    def _kald(args):
+        try:
+            r = subprocess.run(['git','log',*args,'--format=%ad','--date=short','--',sti],
+                               capture_output=True, text=True, timeout=10,
+                               cwd=os.path.dirname(os.path.abspath(__file__)))
+            ud = [l for l in r.stdout.strip().split('\n') if l]
+            return ud[0] if ud else ''
+        except Exception:
+            return ''
+    seneste = _kald(['-1'])
+    foerste = _kald(['--reverse']) or seneste
+    par = (foerste or TODAY, seneste or TODAY)
+    _DATO_CACHE[fn] = par
+    return par
+
+def jsonld(title, desc, url, section, faq, datoer=None):
+    can='https://browsermcp.dev'+url+'/'
+    blocks=[]
+    # BreadcrumbList
+    sec_url='https://browsermcp.dev/docs/install-claude-code/' if section=='Docs' else 'https://browsermcp.dev/compare/browsermcp-io/'
+    blocks.append({"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[
+        {"@type":"ListItem","position":1,"name":"Home","item":"https://browsermcp.dev/"},
+        {"@type":"ListItem","position":2,"name":section,"item":sec_url},
+        {"@type":"ListItem","position":3,"name":title,"item":can}]})
+    # TechArticle (Org author per author-policy)
+    _ta = {"@context":"https://schema.org","@type":"TechArticle","headline":title,"description":desc,"url":can}
+    if datoer:
+        _ta["datePublished"], _ta["dateModified"] = datoer[0], datoer[1]
+    _ta.update({
+        "author":{"@type":"Organization","name":"Agent360","url":"https://agent360.dk"},
+        "publisher":{"@type":"Organization","name":"Agent360","url":"https://agent360.dk"},
+        "about":{"@type":"SoftwareApplication","name":"Browser MCP","applicationCategory":"DeveloperApplication",
+            "operatingSystem":"Chrome","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}})
+    blocks.append(_ta)
+    # FAQPage
+    if faq:
+        blocks.append({"@context":"https://schema.org","@type":"FAQPage","mainEntity":[
+            {"@type":"Question","name":q,"acceptedAnswer":{"@type":"Answer","text":a}} for q,a in faq]})
+    return '\n'.join('<script type="application/ld+json">%s</script>'%json.dumps(b,ensure_ascii=False) for b in blocks)
+
+def sidebar(active):
+    groups={}
+    for fn,grp,label,url in LIVE: groups.setdefault(grp,[]).append((label,url))
+    h=''
+    for grp,items in groups.items():
+        h+='<div class="grp">%s</div>'%grp
+        for label,url in items:
+            cls=' class="active"' if url==active else ''
+            h+='<a href="%s/"%s>%s</a>'%(url,cls,label)
+    return h
+
+nfaq=0
+for fn,grp,label,url in LIVE:
+    lines=clean_lines(SOURCES[url])
+    title=title_of(lines); desc=meta_desc(lines, SOURCES[url]); faq=extract_faq(lines); nfaq+=1 if faq else 0
+    body=md_to_html(lines)
+    page='<!doctype html><html lang="en"><head>\n'+head(title,desc,url)+'\n'+jsonld(title,desc,url,grp,faq,git_datoer(fn))+'\n</head><body>'
+    page+='<div class="top"><div class="top-in"><a class="logo" href="/" style="color:inherit"><span class="m">&#10022;</span> Browser MCP</a><a class="star" href="https://github.com/Agent360dk/browser-mcp" style="color:inherit;text-decoration:none">GitHub &#8599;</a></div></div>'
+    page+='<div class="shell"><nav class="side">'+sidebar(url)+'</nav><main class="content">'+body+related(url)+'</main></div>'
+    page+='<script src="/assets/docs.js"></script></body></html>'
+    disk=REPO+url.strip('/')+'/index.html'
+    os.makedirs(os.path.dirname(disk),exist_ok=True)
+    open(disk,'w').write(page)
+    print('  %-32s desc=%dch faq=%d' % (url, len(desc), len(faq)))
+# MAALT 11/9 (SEO-teamet, curl 404): llms-install.md - installationsvejledningen som AI-assistenter laeser - laa i
+# repo-roden og blev aldrig lagt paa sitet. Den kopieres nu hertil ved hver genbygning, saa roden er eneste kilde,
+# og docs-gatens regen-diff fanger en kopi der er kommet ud af takt.
+# ── sitemap.xml ─────────────────────────────────────────────────────────────
+# MAALT 19/9: sitemappet blev vedligeholdt i haanden, og elleve sider der blev skrevet 19/9
+# stod med `lastmod` 2026-08-22 - altsaa AELDRE end de var. Google bruger lastmod til at
+# beslutte hvornaar der skal crawles igen, saa en for gammel dato arbejder direkte imod det
+# sitemappet er der for. Datoen kommer nu fra filens seneste commit, som resten af siden.
+#
+# De to sider der ikke har en markdown-kilde, staar her - og kun her.
+FASTE_URLS = [
+    ('https://browsermcp.dev/', 'weekly', '1.0', 'index.html'),
+    ('https://browsermcp.dev/privacy.html', 'yearly', '0.3', 'privacy.html'),
+]
+
+def _fast_dato(relsti):
+    try:
+        r = subprocess.run(['git','log','-1','--format=%ad','--date=short','--',os.path.join(REPO, relsti)],
+                           capture_output=True, text=True, timeout=10,
+                           cwd=os.path.dirname(os.path.abspath(__file__)))
+        return (r.stdout.strip() or TODAY)
+    except Exception:
+        return TODAY
+
+_sm = ['<?xml version="1.0" encoding="UTF-8"?>', '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+for _loc, _freq, _pri, _sti in FASTE_URLS:
+    _sm.append('  <url><loc>%s</loc><lastmod>%s</lastmod><changefreq>%s</changefreq><priority>%s</priority></url>'
+               % (_loc, _fast_dato(_sti), _freq, _pri))
+for _fn, _grp, _label, _url in LIVE:
+    # En noindex-side hoerer ikke hjemme i sitemappet - det ville fortaelle Google to
+    # modsatte ting om samme adresse. Det haandhaever docs-gaten begge veje, og det
+    # haandholdte sitemap havde praecis den fejl staaende.
+    if _url in NOINDEX:
+        continue
+    _sm.append('  <url><loc>https://browsermcp.dev%s/</loc><lastmod>%s</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>'
+               % (_url, git_datoer(_fn)[1]))
+_sm.append('</urlset>')
+open(REPO + 'sitemap.xml', 'w').write('\n'.join(_sm) + '\n')
+print('  sitemap.xml: %d adresser, lastmod fra sidste commit (%d noindex holdt ude)'
+      % (len(FASTE_URLS) + len(LIVE) - len(NOINDEX), len(NOINDEX)))
+
+_llms_kilde = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'llms-install.md')
+open(REPO + 'llms-install.md', 'w').write(open(_llms_kilde).read())
+print('Regenerated %d pages · FAQPage schema on %d' % (len(LIVE), nfaq))
+

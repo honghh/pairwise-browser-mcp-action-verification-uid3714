@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+*.log
+.env
+.env.*
+.npmrc
+
+# Efterladt af aerligheds-maalingen naar den koerer Playwright MCP (test/aerlighed/).
+.playwright-mcp/

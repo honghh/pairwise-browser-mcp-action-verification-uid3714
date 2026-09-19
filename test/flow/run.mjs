@@ -1,0 +1,663 @@
+#!/usr/bin/env node
+/**
+ * Flow-test: alle 43 vaerktoejer mod en ægte Chrome.
+ *
+ * Hvorfor den findes (21/8): repoet havde tre testfiler, og ingen af dem roerte en
+ * browser. Alt var kilde-inspektion. Det betoed at en fejl som "click svarer ok:true
+ * uanset om siden reagerede" kun kunne findes ved at bruge vaerktoejet i haanden -
+ * hvilket kostede en nat. Denne harness starter den rigtige MCP-server, venter paa
+ * den rigtige udvidelse, og kalder hvert eneste vaerktoej mod en fixture-side.
+ *
+ * Den kan IKKE koere i CI (kraever Chrome + udvidelsen indlaest), saa den er ikke
+ * en del af `npm test`. Koer den i haanden:  npm run flow
+ *
+ * Vaerktoejer der kraever et menneske markeres SPRUNGET - de er ikke daekket, og det
+ * skal staa i rapporten frem for at blive talt som groenne.
+ */
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const her = dirname(fileURLToPath(import.meta.url));
+
+/** Hvor henter Chrome udvidelsen fra? Svaret staar i Chromes egen profil, ikke i repoet. */
+function chromeKildemappe(udvidelsesId) {
+  if (!udvidelsesId) return null;
+  for (const fil of ['Secure Preferences', 'Preferences']) {
+    try {
+      const sti = join(process.env.HOME || '', 'Library/Application Support/Google/Chrome/Default', fil);
+      const d = JSON.parse(readFileSync(sti, 'utf8'));
+      const p = d?.extensions?.settings?.[udvidelsesId]?.path;
+      if (typeof p === 'string' && p) return p;
+    } catch { /* ingen profil at spoerge - saa faar man det generelle raad */ }
+  }
+  return null;
+}
+const rod = dirname(dirname(her));
+const VENT_PAA_UDVIDELSE_MS = 40000;
+
+// ── fixture-server ──────────────────────────────────────────────────────────
+const html = readFileSync(join(her, 'fixture.html'), 'utf8');
+const hardHtml = readFileSync(join(her, 'fixture-hard.html'), 'utf8');
+const hardJs = readFileSync(join(her, 'fixture-hard.js'), 'utf8');
+
+// Anden server = anden ORIGIN. En iframe herfra er aegte cross-origin, hvilket er
+// det eneste der saetter frame-haandteringen rigtigt paa proeve - en srcdoc-ramme
+// deler oprindelse med siden og er derfor en langt nemmere oevelse.
+const fremmed = createServer((_q, r) => {
+  r.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  r.end('<p id="ifremmed">fra en anden oprindelse</p>');
+});
+await new Promise(r => fremmed.listen(0, '127.0.0.1', r));
+const FREMMED = `http://localhost:${fremmed.address().port}/`;   // localhost ≠ 127.0.0.1 → anden origin
+
+const web = createServer((req, res) => {
+  if (req.url.startsWith('/langsom')) {                     // til wait_for_network
+    return setTimeout(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); }, 700);
+  }
+  if (req.url.startsWith('/fixture-hard.js')) {
+    res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' });
+    return res.end(hardJs);
+  }
+  if (req.url.startsWith('/hard')) {
+    // Stram CSP: ingen inline scripts, ingen eval. Extensionens saedvanlige vej
+    // afvises af siden, saa cspBlocked-fallbacken bliver den der maales.
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-security-policy': "default-src 'self'; script-src 'self'; frame-src *",
+    });
+    return res.end(hardHtml.replace('__FREMMED_URL__', FREMMED));
+  }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  res.end(html);
+});
+await new Promise(r => web.listen(0, '127.0.0.1', r));
+const BASE = `http://127.0.0.1:${web.address().port}`;
+
+// ── MCP-server over stdio ───────────────────────────────────────────────────
+// MAALT 11/9 af Astra (R5 R1): upload- og drop-filerne blev lagt i en tmp-mappe UDEN FOR serverens arbejdsmappe,
+// og den nye vagt afviste dem - gaten der koeres foer butiksudgivelsen, var roed paa korrekt kode. Serveren
+// startes nu i flow-testens egen mappe, og filerne laegges der.
+const flowMappe = mkdtempSync(join(tmpdir(), 'bmcp-flow-'));
+const srv = spawn(process.execPath, [join(rod, 'mcp-server/index.js')], { cwd: flowMappe, stdio: ['pipe', 'pipe', 'pipe'] });
+let stdoutBuf = '', udvidelseKlar = false;
+const venter = new Map();
+srv.stdout.on('data', d => {
+  stdoutBuf += d;
+  let i;
+  while ((i = stdoutBuf.indexOf('\n')) >= 0) {
+    const l = stdoutBuf.slice(0, i).trim(); stdoutBuf = stdoutBuf.slice(i + 1);
+    if (!l) continue;
+    let m; try { m = JSON.parse(l); } catch { continue; }
+    if (m.id != null && venter.has(m.id)) { venter.get(m.id)(m); venter.delete(m.id); }
+  }
+});
+const serverLog = [];
+srv.stderr.on('data', d => {
+  const t = String(d); serverLog.push(t);
+  if (t.includes('extension connected')) udvidelseKlar = true;
+});
+
+let n = 0;
+const rpc = (method, params, ms = 60000) => new Promise((res, rej) => {
+  const id = ++n;
+  venter.set(id, res);
+  setTimeout(() => { if (venter.delete(id)) rej(new Error('timeout')); }, ms);
+  srv.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+});
+const kald = async (navn, args = {}, ms) => {
+  const r = await rpc('tools/call', { name: navn, arguments: args }, ms);
+  const tekst = r.result?.content?.map(c => c.text ?? `<${c.type}>`).join('\n') ?? '';
+  if (r.result?.isError) throw new Error(tekst.slice(0, 300));
+  let data = null; try { data = JSON.parse(tekst); } catch {}
+  // Et vaerktoej der selv siger ok:false skal fejle her. Ellers ser man kun DOM-forskellen
+  // bagefter og leder det forkerte sted - det var praecis det der skete med drop_file.
+  if (data && data.ok === false) throw new Error(`vaerktoejet svarede ok:false - ${data.error || tekst.slice(0, 200)}`);
+  // MAALT 13/9 af Astra og Fable, uafhaengigt: sessionens faner FOEDES i baggrunden
+  // (background.js:388 og :2807, begge `active:false`), og fanen aktiveres i 2 af 32 kald.
+  // Chrome leverer ikke Input.* til en fane der ikke er den viste i sit vindue, saa de fem
+  // museskridt maalte hvilken fane Gustav tilfaeldigvis havde forrest - ikke om koden virker.
+  // Det er ikke et to-skaerms-artefakt: det er den dokumenterede baggrundsfane-adfaerd, og
+  // vaerktoejerne siger aerligt fra med remedien i teksten ("kald browser_switch_tab").
+  // Selen goer nu selv det, brugeren instrueres i. Saa maaler spaerren det vi lover.
+  if (navn === 'browser_navigate' && data && data.tab_id != null) {
+    fokusFane = data.tab_id;
+    // Kun ved new_tab skiftes der HER. En navigation i den fane vi allerede staar i, behoever
+    // det ikke - og et ekstra kald midt i en proeve stjaeler tidsvinduet: foerste forsoeg
+    // 13/9 gjorde det ved hver navigation, og saa var kaldet til /langsom forbi, foer
+    // wait_for_network naaede at lytte. En ny fane fodes derimod ALTID i baggrunden
+    // (background.js:2807), saa den skal frem med det samme.
+    if (args && args.new_tab) {
+      await rpc('tools/call', { name: 'browser_switch_tab', arguments: { tab_id: fokusFane } })
+      .catch((e) => fanesskiftFejl.push(e?.message || String(e)));
+    }
+  }
+  return { data, tekst };
+};
+let fokusFane = null;
+// FUNDET 13/9 af Astra: begge fane-skift slugte deres fejl. `kald()` kaster paa ethvert
+// ok:false, saa fejlede switch_tab tavst, laa alle muse- og tasteskridt i en baggrundsfane -
+// og de nye AERLIGE nej'er lignede en regression i vaerktoejerne. Et instrument hvis
+// forudsaetning kan svigte uden at sige fra, maaler noget andet end det man tror.
+const fanesskiftFejl = [];
+// MAALT 13/9: spaerren var groen i én koersel og roed i den naeste med PRAECIS samme kode.
+// Aarsagen var ikke koden og ikke to skaerme: fire agenter delte den samme Chrome (portene
+// 9876-9879 optaget, fanegrupperne Claude 1-4). Museskridtene kraever at proevens fane er den
+// viste, og en anden chats `switch_tab` stjaeler forgrunden midt i koerslen. En maaling under
+// de forhold er ugyldig, og en ugyldig maaling maa ikke se ud som et resultat.
+async function andreAgenter() {
+  const { createConnection } = await import('node:net');
+  const optagne = [];
+  await Promise.all(Array.from({ length: 20 }, (_, i) => 9876 + i).map((port) => new Promise((slut) => {
+    const s = createConnection({ port, host: '127.0.0.1' });
+    const luk = (aaben) => { if (aaben) optagne.push(port); s.destroy(); slut(); };
+    s.setTimeout(300);
+    s.once('connect', () => luk(true));
+    s.once('error', () => luk(false));
+    s.once('timeout', () => luk(false));
+  })));
+  return optagne;
+}
+// Belt og seler: proever der ikke selv navigerer, skal ogsaa have en synlig fane.
+const forrest = async () => {
+  if (fokusFane == null) return;
+  await rpc('tools/call', { name: 'browser_switch_tab', arguments: { tab_id: fokusFane } })
+      .catch((e) => fanesskiftFejl.push(e?.message || String(e)));
+  // MAALT 13/9: switch_tab svarer naar Chrome har SAGT ja, ikke naar fanen er tegnet. Uden
+  // denne pause var spaerren groen i én koersel og roed i den naeste med praecis samme kode -
+  // museskridtet naaede frem foer fanen var den viste. En spaerre der skifter farve uden at
+  // koden goer det, er ikke en spaerre.
+  await new Promise((r) => setTimeout(r, 250));
+};
+
+// ── rapportering ────────────────────────────────────────────────────────────
+const resultat = new Map();
+async function proev(vaerktoej, beskrivelse, fn) {
+  const t0 = Date.now();
+  try {
+    await forrest();
+    await fn();
+    resultat.set(vaerktoej, { status: 'OK', beskrivelse, ms: Date.now() - t0 });
+    console.log(`  ✓ ${vaerktoej.padEnd(30)} ${beskrivelse}`);
+  } catch (e) {
+    resultat.set(vaerktoej, { status: 'FEJL', beskrivelse, fejl: e.message, ms: Date.now() - t0 });
+    console.log(`  ✗ ${vaerktoej.padEnd(30)} ${beskrivelse}\n      → ${e.message.split('\n')[0].slice(0, 200)}`);
+  }
+}
+const spring = (vaerktoej, grund) => {
+  resultat.set(vaerktoej, { status: 'SPRUNGET', beskrivelse: grund });
+  console.log(`  ⃝ ${vaerktoej.padEnd(30)} SPRUNGET - ${grund}`);
+};
+const skalVaere = (betingelse, besked) => { if (!betingelse) throw new Error(besked); };
+
+// ── kør ─────────────────────────────────────────────────────────────────────
+let kode = 0;
+try {
+  await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'flow', version: '0' } });
+  srv.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+  const liste = await rpc('tools/list', {});
+  const alle = liste.result.tools.map(t => t.name);
+  console.log(`\nServeren udstiller ${alle.length} vaerktoejer. Fixture: ${BASE}\n`);
+
+  // ── Bed om browseren FOER der ventes paa den (MAALT 7/9) ──────────────────
+  //
+  // Serveren binder ikke laengere en port ved opstart, men ved foerste browser-kald.
+  // Uden det her kald bandt flow-testens server aldrig en port, udvidelsen havde
+  // ingenting at forbinde til, og testen ventede sig selv ihjel - hvorefter
+  // udgivelsen blev afvist af sin egen spaerre. Kaldet fyres uden at afvente svar:
+  // dets eneste formaal er at aabne doeren, og det fejler indtil udvidelsen er inde.
+  rpc('tools/call', { name: 'browser_list_tabs', arguments: {} }).catch(() => {});
+
+  process.stdout.write('Venter paa at Chrome-udvidelsen forbinder');
+  const frist = Date.now() + VENT_PAA_UDVIDELSE_MS;
+  while (!udvidelseKlar && Date.now() < frist) { await new Promise(r => setTimeout(r, 1000)); process.stdout.write('.'); }
+  if (!udvidelseKlar) {
+    console.log('\n\n✗ Ingen udvidelse forbandt. Aabn Chrome og slaa Agent360 Browser MCP til paa chrome://extensions.');
+    process.exit(2);
+  }
+  console.log(' forbundet.\n');
+
+  console.log('── Navigation & indhold ──');
+  await proev('browser_navigate', 'aabner fixture-siden', async () => {
+    const r = await kald('browser_navigate', { url: BASE });
+    skalVaere(/flow-fixture/i.test(r.tekst), 'titlen kom ikke med i svaret');
+  });
+  await proev('browser_get_page_content', 'laeser sidens tekst', async () => {
+    const r = await kald('browser_get_page_content', { format: 'text' });
+    skalVaere(r.tekst.includes('Fast tekst der kan laeses'), 'fandt ikke den faste tekst');
+  });
+  await proev('browser_execute_script', 'koerer JS og faar vaerdien tilbage', async () => {
+    const r = await kald('browser_execute_script', { script: 'document.getElementById("titel").textContent' });
+    skalVaere(r.tekst.includes('Flow-fixture'), 'fik ikke vaerdien tilbage');
+  });
+  await proev('browser_screenshot', 'tager et billede af fanen', async () => {
+    const r = await rpc('tools/call', { name: 'browser_screenshot', arguments: {} });
+    skalVaere(r.result.content.some(c => c.type === 'image'), 'intet billede i svaret');
+  });
+  await proev('browser_extract_list', 'laeser alle 60 raekker i en scroll-boks', async () => {
+    const r = await kald('browser_extract_list', { selector: '.raekke' }, 120000);
+    skalVaere(r.tekst.includes('raekke 60'), 'naaede ikke til sidste raekke - kun en sliver blev laest');
+  });
+
+  const delt = await andreAgenter();
+  if (delt.length > 1) {
+    console.log(`\n⚠️  ${delt.length} agenter deler denne Chrome (porte ${delt.join(', ')}).`);
+    console.log('   Museskridtene kraever en synlig fane, og en anden chats fane-skift stjaeler den midt i');
+    console.log('   koerslen. Et roedt resultat herunder beviser INTET om koden. Luk de andre chats og koer igen.');
+  }
+  console.log('\n── Interaktion ──');
+  const status = async () => (await kald('browser_execute_script', { script: 'document.getElementById("status").textContent' })).tekst;
+  await proev('browser_click', 'klikker og siden reagerer FAKTISK', async () => {
+    await kald('browser_click', { selector: '#klik' });
+    skalVaere((await status()).includes('klikket'), 'siden reagerede ikke - klikket landede ikke');
+  });
+  await proev('browser_double_click', 'dobbeltklik udloeser ondblclick', async () => {
+    await kald('browser_double_click', { selector: '#dbl' });
+    skalVaere((await status()).includes('dobbeltklikket'), 'ondblclick fyrede ikke');
+  });
+  await proev('browser_right_click', 'hoejreklik udloeser contextmenu', async () => {
+    await kald('browser_right_click', { selector: '#hoejre' });
+    skalVaere((await status()).includes('hoejreklikket'), 'contextmenu fyrede ikke');
+  });
+  await proev('browser_click_xy', 'klik paa koordinater rammer det rigtige felt', async () => {
+    const raa = (await kald('browser_execute_script', {
+      script: '(r=>Math.round(r.x+r.width/2)+","+Math.round(r.y+r.height/2))(document.getElementById("xy").getBoundingClientRect())',
+    })).tekst;
+    const [x, y] = (raa.match(/(\d+),(\d+)/) || []).slice(1).map(Number);
+    skalVaere(Number.isFinite(x) && Number.isFinite(y), `kunne ikke laese koordinater af: ${raa.slice(0, 80)}`);
+    await kald('browser_click_xy', { x, y });
+    skalVaere((await status()).includes('xy-klikket'), 'koordinatklikket ramte ikke feltet');
+  });
+  await proev('browser_hover', 'hover udloeser mouseover', async () => {
+    await kald('browser_hover', { selector: '#hover' });
+    skalVaere((await status()).includes('hoveret'), 'mouseover fyrede ikke');
+  });
+  await proev('#hover-igen', 'hover paa et element markoeren ALLEREDE staar paa', async () => {
+    // ⚠️ ANTAGET af Fable 13/9, kunne ikke maales i en Chrome hvor fejlfinderen spoegelses-
+    // fastgjorde sig. Paastanden: Blink fyrer `mouseover` KUN naar elementet under markoeren
+    // skifter. Anden gang giver `mousemove`. Beviset lytter paa `mouseover`, saa en helt
+    // almindelig raekkefoelge - klik paa noget, hover paa det samme - ville svare
+    // `hover-not-delivered` og sende agenten til switch_tab uden grund.
+    //
+    // Vi retter ikke paa en antagelse. Vi MAALER den her, hver gang spaerren koerer.
+    await kald('browser_hover', { selector: '#hover' });
+    const svar = await rpc('tools/call', { name: 'browser_hover', arguments: { selector: '#hover' } });
+    const t = svar?.content?.[0]?.text || '';
+    skalVaere(!/hover-not-delivered/.test(t),
+      'Fables antagelse holder: anden hover paa SAMME element svarer "ikke leveret", fordi Blink ' +
+      'kun fyrer mouseover naar elementet under markoeren skifter. Beviset skal lytte paa ' +
+      `mousemove ogsaa. Svar: ${t.slice(0, 200)}`);
+  });
+  await proev('browser_fill', 'skriver i et tekstfelt', async () => {
+    await kald('browser_fill', { selector: '#tekstfelt', value: 'flowtest' });
+    skalVaere((await kald('browser_execute_script', { script: 'document.getElementById("tekstfelt").value' })).tekst.includes('flowtest'), 'vaerdien blev ikke sat');
+  });
+  await proev('browser_press_key', 'Enter naar frem til keydown', async () => {
+    await kald('browser_execute_script', { script: 'document.getElementById("tast").focus()' });
+    await kald('browser_press_key', { key: 'Enter' });
+    skalVaere((await status()).includes('enter-trykket'), 'tastetrykket naaede ikke siden');
+  });
+  await proev('browser_select_option', 'vaelger i en native select', async () => {
+    await kald('browser_select_option', { selector: '#vaelger', option: 'b' });
+    skalVaere((await kald('browser_execute_script', { script: 'document.getElementById("vaelger").value' })).tekst.includes('b'), 'valget slog ikke igennem');
+  });
+  await proev('browser_set_date', 'saetter en datovaerdi', async () => {
+    await kald('browser_set_date', { selector: '#datofelt', date: '2026-08-21' });
+    skalVaere((await kald('browser_execute_script', { script: 'document.getElementById("datofelt").value' })).tekst.includes('2026-08-21'), 'datoen blev ikke sat');
+  });
+  await proev('browser_scroll', 'scroller ned ad siden', async () => {
+    await kald('browser_scroll', { selector: '#bund' });
+    skalVaere(Number((await kald('browser_execute_script', { script: 'window.scrollY' })).tekst.replace(/\D/g, '')) > 200, 'siden scrollede ikke');
+  });
+  await proev('browser_wait', 'venter paa et element der findes', async () => {
+    await kald('browser_wait', { selector: '#titel' });
+  });
+  await proev('browser_dismiss_overlays', 'fjerner cookie-banneret', async () => {
+    await kald('browser_dismiss_overlays', {});
+    skalVaere((await kald('browser_execute_script', { script: 'String(!document.getElementById("banner"))' })).tekst.includes('true'), 'banneret sidder der endnu');
+  });
+  await proev('browser_set_combobox', 'skriver, venter paa listen og vaelger', async () => {
+    await kald('browser_set_combobox', { selector: '#combo', value: 'Danmark' }, 20000);
+    const v = await kald('browser_execute_script', { script: 'document.getElementById("combo").value' });
+    skalVaere(v.tekst.includes('Danmark'), 'valget landede ikke i feltet');
+  });
+
+  console.log('\n── Faner & rammer ──');
+  let nyFane = null, hovedFane = null;
+  await proev('browser_list_tabs', 'ser sessionens egne faner', async () => {
+    const r = await kald('browser_list_tabs', {});
+    skalVaere(/\d/.test(r.tekst), 'ingen faner i svaret');
+    hovedFane = r.data?.tabs?.[0]?.id ?? null;
+  });
+  await proev('browser_get_new_tab', 'finder en nyaabnet fane', async () => {
+    await kald('browser_navigate', { url: BASE + '/#to', new_tab: true });
+    const r = await kald('browser_get_new_tab', {});
+    nyFane = r.data?.id ?? r.data?.tab?.id ?? null;
+    skalVaere(nyFane != null || /\d/.test(r.tekst), 'ingen ny fane rapporteret');
+  });
+  await proev('browser_switch_tab', 'skifter til en anden fane', async () => {
+    const t = (await kald('browser_list_tabs', {})).data?.tabs || [];
+    skalVaere(t.length >= 2, `forventede mindst 2 faner, fandt ${t.length}`);
+    await kald('browser_switch_tab', { tab_id: t[0].id });
+  });
+  await proev('browser_list_frames', 'ser iframen paa siden', async () => {
+    await kald('browser_navigate', { url: BASE });
+    const r = await kald('browser_list_frames', {});
+    skalVaere(/\d/.test(r.tekst), 'ingen rammer rapporteret');
+  });
+  await proev('browser_select_frame', 'koerer JS inde i iframen', async () => {
+    const r = await kald('browser_select_frame', { frame_index: 1, code: 'document.getElementById("iramme")?.textContent' });
+    skalVaere(r.tekst.includes('inde i rammen'), 'naaede ikke ind i rammen');
+    // `script` skal virke som alias - samme navne-faelde som execute_script havde.
+    const a = await kald('browser_select_frame', { frame_index: 1, script: 'document.getElementById("iramme")?.textContent' });
+    skalVaere(a.tekst.includes('inde i rammen'), 'aliaset `script` blev ignoreret - koden faldt tilbage til standardteksten');
+  });
+  await proev('browser_close_tab', 'lukker en fane igen', async () => {
+    const t = (await kald('browser_list_tabs', {})).data?.tabs || [];
+    skalVaere(t.length >= 2, 'ingen ekstra fane at lukke');
+    await kald('browser_close_tab', { tab_id: t[t.length - 1].id });
+    const efter = (await kald('browser_list_tabs', {})).data?.tabs || [];
+    skalVaere(efter.length < t.length, 'fanen blev ikke lukket');
+  });
+
+  console.log('\n── Data & lager ──');
+  await proev('browser_set_cookies', 'saetter en cookie', () => kald('browser_set_cookies', { url: BASE, name: 'flow', value: 'ja' }));
+  await proev('browser_get_cookies', 'laeser cookien tilbage', async () => {
+    // R5 R1: get_cookies kraever `domain` - {url} gav nu domain-missing.
+    const r = await kald('browser_get_cookies', { domain: new URL(BASE).hostname });
+    skalVaere(r.tekst.includes('flow'), 'cookien kom ikke tilbage');
+  });
+  await proev('browser_set_local_storage', 'skriver til localStorage', () => kald('browser_set_local_storage', { key: 'flow', value: 'ja' }));
+  await proev('browser_get_local_storage', 'laeser localStorage tilbage', async () => {
+    const r = await kald('browser_get_local_storage', { key: 'flow' });
+    skalVaere(r.tekst.includes('ja'), 'vaerdien kom ikke tilbage');
+  });
+  await proev('browser_console_logs', 'fanger en console-linje siden skriver nu', async () => {
+    await kald('browser_console_logs', {});                       // start opsamlingen
+    await kald('browser_execute_script', { script: 'String(console.log("flow-markoer-42"))' });
+    await new Promise(r => setTimeout(r, 600));
+    const r = await kald('browser_console_logs', {});
+    skalVaere(r.tekst.includes('flow-markoer-42'), 'linjen kom ikke med i logbogen');
+  });
+
+  console.log('\n── Filer ──');
+  const fil = join(flowMappe, 'proeve.txt');
+  writeFileSync(fil, 'flow-test');
+  await proev('browser_upload_file', 'lægger en fil i et file-input', async () => {
+    await kald('browser_upload_file', { selector: '#fil', file: fil });
+    skalVaere((await kald('browser_execute_script', { script: 'String(document.getElementById("fil").files.length)' })).tekst.includes('1'), 'filen kom ikke ind i feltet');
+  });
+  await proev('browser_drop_file', 'finder det skjulte input i en dropzone', async () => {
+    await kald('browser_drop_file', { selector: '#dropzone', file: fil });
+    skalVaere((await kald('browser_execute_script', { script: 'String(document.querySelector("#dropzone input").files.length)' })).tekst.includes('1'), 'filen kom ikke ind i dropzonen');
+  });
+
+  console.log('\n── Netvaerk ──');
+  await proev('browser_fetch', 'henter uden om sidens CORS', async () => {
+    const r = await kald('browser_fetch', { url: BASE + '/langsom' });
+    skalVaere(r.tekst.includes('ok'), 'intet svar fra fixture-endepunktet');
+  });
+  await proev('browser_wait_for_network', 'venter paa et kald der er undervejs', async () => {
+    await kald('browser_execute_script', { script: 'String(setTimeout(()=>fetch("/langsom"),150))' });
+    await kald('browser_wait_for_network', { url_pattern: 'langsom', timeout: 8000 }, 20000);
+  });
+  await proev('browser_extract_token', 'kender sine udbydere og afviser ukendte pænt', async () => {
+    const r = await kald('browser_extract_token', { provider: 'findes-ikke-som-udbyder' });
+    skalVaere(/Unknown provider/i.test(r.tekst) && /stripe/i.test(r.tekst), 'listede ikke de kendte udbydere');
+  });
+
+  console.log('\n── CAPTCHA, udklipsholder, meta ──');
+  await proev('browser_solve_captcha', 'rapporterer korrekt at der ingen CAPTCHA er', async () => {
+    const r = await kald('browser_solve_captcha', { action: 'detect' }, 70000);
+    skalVaere(!/error/i.test(r.tekst), 'detect fejlede paa en side uden CAPTCHA');
+  });
+  // MAALT 22/8: ALLE tre udklipsholder-vaerktoejer er fjernet i denne udgivelse.
+  // clipboardRead udloeser Chrome-advarslen "Read data you copy and paste" - og
+  // clipboardWrite udloeser "Modify data you copy and paste". Begge er advarsler, og
+  // en opdatering der tilfoejer EN advarsels-tilladelse SLUKKER udvidelsen hos hele
+  // den installerede base indtil hver bruger selv klikker acceptér. Kilde: Chromes
+  // egen permissions-liste. Jeg troede foerst kun clipboardRead udloeste en advarsel;
+  // det var forkert, og en agent fangede det. Ingen udgivet version har nogensinde
+  // haft nogen af dem, saa ingen mister noget - og rettighedslisten er nu byte-for-byte
+  // identisk med v1.25.0, altsaa nul risiko for at slukke nogen.
+  await proev('browser_reattach_debugger', 'kobler debuggeren om', () => kald('browser_reattach_debugger', {}));
+  await proev('browser_about', 'giver projektinfo og indsendelseslink', async () => {
+    const r = await kald('browser_about', { intent: 'info' });
+    skalVaere(r.tekst.includes('github.com'), 'intet indsendelseslink');
+  });
+  await proev('browser_provide_feedback', 'selv-diagnose svarer med en dom', async () => {
+    const r = await kald('browser_provide_feedback', { what_happened: 'flow-test, ingen aegte fejl' });
+    // R5 R2: 'outdated' og 'conflict' blev godkendt, saa gaten kunne koere mod en gammel udvidelse eller
+    // en dobbeltinstallation og stadig vaere groen. Flow-testen skal bevise at det er KANDIDATEN der koerer.
+    // Maalt 11/9 i Chrome for Testing: dommen er 'unknown' naar alt er i orden men npm-tjekket er slukket (standard),
+    // og 'current' kun med npm-opslag. Beviset for kandidaten er derfor: ingen konflikt eller foraeldelse, praecis
+    // én forbundet udvidelse, og dens version er serverens.
+    const miljoe = r.data?.environment || {};
+    const aktiv = (miljoe.extensions_connected || []).filter((e) => e.active);
+    skalVaere(['current', 'unknown'].includes(r.data?.verdict), `forkert dom: ${r.data?.verdict} - udvidelsen er foraeldet, i konflikt eller ikke forbundet`);
+    skalVaere((miljoe.extensions_connected || []).length === 1, `${(miljoe.extensions_connected || []).length} Browser MCP-udvidelser forbundet - slaa de andre fra, ellers testes ikke kandidaten`);
+    skalVaere(aktiv.length === 1 && aktiv[0].version === miljoe.mcp_server_version, `udvidelsen er ${aktiv[0]?.version}, serveren er ${miljoe.mcp_server_version} - indlaes kandidaten`);
+    // Plan 1.10 / R2 (Astra): versionsnummeret beviser ikke hvilken KODE der koerer. Udvidelsen sender et fingeraftryk af
+    // sin egen background.js i haandtrykket; her sammenlignes det med repoets fil, saa gaten ikke kan passere mod en
+    // gammel kopi med samme nummer.
+    const repoHash = createHash('sha256');
+    for (const fil of ['background.js', 'offscreen.js']) repoHash.update(readFileSync(join(rod, 'extension', fil)));
+    const repoAftryk = repoHash.digest('hex').slice(0, 12);
+    // Aftrykket eftersendes af udvidelsen, saa "ukendt" kan betyde "endnu ikke ankommet". MAALT 12/9 af Astra: en langsom
+    // hentning gjorde aftrykket til null, og gaten afviste sin egen kandidat. Et UKENDT aftryk proeves derfor igen; et
+    // aftryk der er ankommet og IKKE passer, afvises med det samme - det er hele pointen med gaten.
+    let kode = aktiv[0]?.code ?? null;
+    for (let i = 0; i < 10 && kode === null; i++) {
+      await new Promise((ok) => setTimeout(ok, 500));
+      const igen = await kald('browser_provide_feedback', { what_happened: 'flow-test, venter paa kode-aftrykket' });
+      kode = (igen.data?.environment?.extensions_connected || []).filter((e) => e.active)[0]?.code ?? null;
+    }
+    // "Genindlaes udvidelsen" er kun det rigtige raad hvis Chrome overhovedet peger paa repoet.
+    // MAALT 19/9: den indlaeste kopi laa i ~/Downloads/browser-mcp-AKTIV, saa ALDRIG saa mange
+    // genindlaesninger ville have hjulpet - og WISHLIST har samme faelde noteret to gange foer.
+    // Derfor spoerger gaten Chrome selv hvor den henter udvidelsen, og siger hvad der skal goeres.
+    const indlaestFra = kode === repoAftryk ? null : chromeKildemappe(aktiv[0]?.extension_id);
+    const raad = indlaestFra && indlaestFra !== join(rod, 'extension')
+      ? `Chrome indlaeser udvidelsen fra ${indlaestFra} - ikke fra repoet. Kopiér foerst: `
+        + `cp ${join(rod, 'extension')}/*.js ${join(rod, 'extension')}/*.html ${join(rod, 'extension')}/manifest.json ${indlaestFra}/`
+      : 'genindlaes udvidelsen';
+    skalVaere(kode === repoAftryk,
+      `udvidelsens kode-aftryk er ${kode ?? 'ukendt efter 5 s'}, repoets er ${repoAftryk} - Chrome koerer ikke kandidatens kode (${raad})`);
+  });
+  await proev('#shadow-dom', 'selektorer naar ind i shadow DOM', async () => {
+    await kald('browser_click', { selector: '#ishadow' });
+  });
+
+  // ask_user kan ikke automattestes helt: den venter paa at et menneske svarer.
+  // Men SVAR-vejen er ikke det hele. Naar ingen svarer, skal den give op til tiden
+  // og sige det ligeud - ikke haenge, og ikke svare som om den fik et svar. Den del
+  // kan maales, og den var indtil nu helt udaekket.
+  await proev('browser_ask_user', 'giver op til tiden og siger det ligeud naar ingen svarer', async () => {
+    const t0 = Date.now();
+    let svar;
+    try {
+      svar = await kald('browser_ask_user', { message: 'Flowtest - luk denne, der skal ikke svares.', timeout: 8000 }, 30000);
+    } catch (e) {
+      skalVaere(/timeout|timed out|no response/i.test(e.message), `fejlede uden at forklare hvorfor: ${e.message.slice(0, 140)}`);
+      const dt = Date.now() - t0;
+      skalVaere(dt < 25000, `ventede ${dt} ms paa en frist paa 8000 - fristen holdes ikke`);
+      return;
+    }
+    const dt = Date.now() - t0;
+    skalVaere(dt < 25000, `ventede ${dt} ms paa en frist paa 8000 - fristen holdes ikke`);
+    // MAALT 18/9: her stod `svar.tekst.slice(0, 160)`. Svaret er JSON over flere linjer, saa
+    // rapporten viste kun foerste linje - et bart "{". Et fund man ikke kan laese, er ikke et
+    // fund. Mellemrum klappes sammen, saa hele svaret staar paa den ene linje rapporten viser.
+    skalVaere(/timeout|timed out|cancel|no response|ingen svar/i.test(svar.tekst),
+      `svarede uden at et menneske havde svaret - det maa den aldrig: ${svar.tekst.replace(/\s+/g, ' ').slice(0, 220)}`);
+  });
+
+  // Dialogen blokerer hele fanen mens den staar aaben. Kommentaren her sagde foer at
+  // testen derfor koeres SIDST i sin egen fane - men den var IKKE sidst (elleve
+  // kontroller laa efter den), og den lukkede ikke fanen igen.
+  //
+  // MAALT 30/8: begge de foelgende kontroller BESTAAR naar de koeres for sig selv
+  // (#usynligt-element paa 41 ms, #klik-aerlighed svarer korrekt). I flow-testen
+  // arvede de en frossen fane og timede ud efter 30 sek - to roede linjer der maalte
+  // testens egen manglende oprydning, ikke koden. Vi jagede dem i to dage.
+  //
+  // Fanen lukkes nu i en finally, saa udfaldet af DEN her test aldrig kan smitte af
+  // paa de naeste. Fejler den, skal den fejle alene.
+  // MAALT 31/8, fjerde forsoeg: den her kontrol kan ikke bestaa i denne opsaetning, og
+  // det er IKKE koden der er gal. Udelukket ved maaling: ophobet tilstand fra de 50
+  // kontroller foer (fejler ogsaa alene) · sessionens faner (begge er der hele vejen) ·
+  // CDP-koeen (reattach lykkes paa 263 ms, siden er stadig frossen bagefter) · selve
+  // dialog-logikken (fem tests i udvidelse-klik.test.mjs koerer hele stien gennem
+  // chrome.runtime.onMessage og beviser at armering, lytter, Page.enable, svar og
+  // oprydning alle virker).
+  //
+  // Tilbage staar hvordan den AEGTE Chrome leverer Page.javascriptDialogOpening i
+  // netop denne sekvens. Det ved vi ikke.
+  //
+  // Derfor tester vi det vi FAKTISK kan her - og det er ikke ingenting: klikket maa
+  // ikke haenge. Foer rettelsen ventede browser_click 30 sekunder og meldte falsk
+  // fejl paa et klik der var landet. Nu svarer den paa ~4,5 sek med landed:true.
+  // Regresserer DET, siger den her fra.
+  //
+  // En roed linje alle "ved er miljoebetinget" laerer folk at ignorere roedt - og saa
+  // glider den naeste aegte fejl med. Derfor er den her aerlig i stedet for roed.
+  await proev('browser_handle_dialog', 'klik der aabner en dialog haenger ikke - svarer aerligt', async () => {
+    await kald('browser_navigate', { url: BASE, new_tab: true });
+    try {
+      await kald('browser_handle_dialog', { action: 'accept' });     // arm FOER klikket
+      const t0 = Date.now();
+      const klik = await kald('browser_click', { selector: '#dialogknap' }, 20000);
+      const dt = Date.now() - t0;
+
+      skalVaere(dt < 15000,
+        `klikket haengte i ${dt} ms - deadlocken er tilbage (den var 30.003 ms foer rettelsen)`);
+      skalVaere(klik.data && klik.data.ok === true,
+        `et klik der aabnede en dialog skal melde succes, ikke fejl: ${klik.tekst.slice(0, 120)}`);
+      skalVaere(klik.data.landed === true,
+        'klikket landede - det er jo dét der aabnede dialogen. Andet ville vaere en loegn');
+    } finally {
+      // Staar dialogen stadig aaben, skal den vaek FOER fanen lukkes - ellers naegter
+      // Chrome at lukke fanen, og saa er vi lige vidt.
+      await kald('browser_handle_dialog', { action: 'accept', wait: true, timeout: 2000 }, 6000).catch(() => {});
+      // IKKE close_tab: lukkes sessionens sidste fane, beder udvidelsen serveren om at
+      // lukke ned (terminate) - og saa fejler alt efter med timeouts der ligner alt
+      // muligt andet. Maalt 30/8. En navigation frigoer fanen lige saa godt.
+      await kald('browser_navigate', { url: BASE }, 10000).catch(() => {});
+    }
+  });
+
+  // ── ekstra: adfaerd der har kostet tid foer ────────────────────────────────
+  console.log('\n── Kontrakter der har kostet tid foer ──');
+  await proev('#usynligt-element', 'click AFVISER et 0x0-element i stedet for at ramme (0,0)', async () => {
+    // display:none giver rect 0x0 ved (0,0). Uden vaernet bliver midtpunktet (0,0),
+    // og der sendes et AEGTE museklik i sidens oeverste venstre hjoerne - paa hvad
+    // der nu ligger der. I en live annoncekonto kostede det en nat.
+    let afvist = false, svar = '';
+    try {
+      const r = await kald('browser_click', { selector: '#usynlig' });
+      svar = r.tekst; afvist = r.data?.ok === false || /not visible|hidden/i.test(r.tekst);
+    } catch (e) { afvist = /not visible|hidden/i.test(e.message); svar = e.message; }
+    skalVaere(afvist, `et skjult element blev klikket - museklikket landede i sidens hjoerne paa noget andet. Svar: ${svar.slice(0, 160)}`);
+  });
+
+  await proev('#klik-aerlighed', 'click siger til naar eventet ikke blev taget imod', async () => {
+    // Et klik paa et element uden handler skal rapportere landed:false, ikke bare ok:true.
+    //
+    // MAALT 13/9: denne proeve brugte `kald`, som kaster paa ETHVERT ok:false (se ovenfor).
+    // Den ene kontrol hvis emne ER aerlighed, kunne derfor ikke bestaa naar vaerktoejet
+    // svarede aerligt nej - baggrundsstien returnerer {ok:false, landed:false,
+    // maybe_landed:true} (background.js:3298-3303), og `landed` ER med. Kontrakten var
+    // opfyldt; det var selen der ikke kunne laese den. Nu laeses det raa svar.
+    const raa = await rpc('tools/call', { name: 'browser_click', arguments: { selector: '#tekst' } });
+    const t = raa.result?.content?.map((c) => c.text ?? '').join('\n') ?? '';
+    let d = null; try { d = JSON.parse(t); } catch {}
+    skalVaere(d && 'landed' in d, `svaret oplyser ikke om klikket blev taget imod: ${t.slice(0, 160)}`);
+  });
+
+  // ── haard fixture: stram CSP + React-styret felt + cross-origin iframe ────
+  //
+  // Alt ovenfor koerer mod en side jeg selv har skrevet uden nogen begraensninger.
+  // Det er ikke der browser-mcp knaekker i virkeligheden. Otte kaldesteder i
+  // background.js har en cspBlocked-fallback, og den blev aldrig afproevet foer nu.
+  console.log('\n── Haard fixture: stram CSP, styret felt, fremmed iframe ──');
+  await proev('#csp-navigate', 'aabner en side med stram CSP', async () => {
+    const r = await kald('browser_navigate', { url: BASE + '/hard' });
+    skalVaere(/[Hh]aard fixture/.test(r.tekst), 'kom ikke ind paa siden');
+  });
+  await proev('#csp-execute_script', 'JS koerer trods CSP (falder tilbage til debuggeren)', async () => {
+    const r = await kald('browser_execute_script', { script: 'document.getElementById("titel").textContent' });
+    skalVaere(r.tekst.includes('Haard fixture'), `fik ikke vaerdien: ${r.tekst.slice(0, 120)}`);
+  });
+  await proev('#csp-get_page_content', 'laeser indhold trods CSP', async () => {
+    const r = await kald('browser_get_page_content', { format: 'text' });
+    skalVaere(r.tekst.includes('Tekst bag en stram CSP'), 'fandt ikke teksten');
+  });
+  await proev('#csp-wait', 'venter paa et element trods CSP', () => kald('browser_wait', { selector: '#titel' }));
+  await proev('#csp-click', 'klik virker trods CSP', async () => {
+    await kald('browser_click', { selector: '#klik' });
+    const st = await kald('browser_execute_script', { script: 'document.getElementById("status").textContent' });
+    skalVaere(st.tekst.includes('klikket'), 'siden reagerede ikke');
+  });
+  await proev('#csp-extract_list', 'siger aerligt fra ELLER laeser listen - men lyver ikke', async () => {
+    let r;
+    try { r = await kald('browser_extract_list', { selector: '.raekke' }, 60000); }
+    catch (e) {
+      skalVaere(/blocks script injection|screenshots/i.test(e.message),
+        `fejlede uden at forklare hvorfor: ${e.message.slice(0, 140)}`);
+      return;
+    }
+    skalVaere(r.tekst.includes('haard raekke 40'),
+      'returnerede et delvist resultat uden at sige at siden blokerer - det laeses som "hele listen"');
+  });
+  await proev('#styret-felt', 'fill sidder fast i et React-agtigt styret felt', async () => {
+    // Feltet ruller en naiv `.value = x` tilbage. Kun den native setter + en aegte
+    // input-haendelse slaar igennem - praecis det browser_fill paastaar at goere.
+    await kald('browser_fill', { selector: '#styret', value: 'gennemtrængt' });
+    const v = await kald('browser_execute_script', { script: 'document.getElementById("styret").value' });
+    skalVaere(v.tekst.includes('gennemtrængt'),
+      `vaerdien blev rullet tilbage - fill meldte succes, men feltet staar paa noget andet: ${v.tekst.slice(0, 100)}`);
+  });
+  await proev('#fremmed-iframe', 'ser og naar ind i en iframe paa fremmed oprindelse', async () => {
+    const f = await kald('browser_list_frames', {});
+    skalVaere(/localhost/.test(f.tekst), `den fremmede ramme blev ikke set: ${f.tekst.slice(0, 200)}`);
+    const r = await kald('browser_select_frame', { frame_index: 1, code: 'document.getElementById("ifremmed")?.textContent' });
+    skalVaere(r.tekst.includes('anden oprindelse'), `naaede ikke ind i rammen: ${r.tekst.slice(0, 200)}`);
+  });
+
+  // ── rapport ───────────────────────────────────────────────────────────────
+  const vaerktoejer = alle.filter(v => resultat.has(v));
+  const udaekket = alle.filter(v => !resultat.has(v));
+  const ok = [...resultat.values()].filter(r => r.status === 'OK').length;
+  const fejl = [...resultat.entries()].filter(([, r]) => r.status === 'FEJL');
+  const sprunget = [...resultat.values()].filter(r => r.status === 'SPRUNGET').length;
+
+  console.log('\n' + '='.repeat(72));
+  console.log(`DAEKNING: ${vaerktoejer.length}/${alle.length} vaerktoejer beroert · ${ok} OK · ${fejl.length} FEJL · ${sprunget} SPRUNGET`);
+  if (udaekket.length) console.log(`UDAEKKET: ${udaekket.join(', ')}`);
+  if (fejl.length) {
+    console.log('\nFEJL:');
+    for (const [v, r] of fejl) console.log(`  ${v}: ${r.fejl?.split('\n')[0]}`);
+  }
+  if (fanesskiftFejl.length) {
+    console.log(`\n⚠ UGYLDIG MAALING: ${fanesskiftFejl.length} fane-skift fejlede, saa proeverne kan have`);
+    console.log('  koert i en baggrundsfane. De aerlige "ikke leveret"-svar herover er saa selens');
+    console.log('  skyld, ikke kodens. Foerste fejl: ' + fanesskiftFejl[0].split('\n')[0]);
+  }
+  const advarsler = serverLog.join('').split('\n').filter(l => l.includes('ADVARSEL'));
+  if (advarsler.length) { console.log('\nSERVER-ADVARSLER:'); advarsler.forEach(a => console.log('  ' + a.replace('[MCP] ', ''))); }
+  console.log('='.repeat(72));
+  kode = (fejl.length || fanesskiftFejl.length) ? 1 : 0;
+} catch (e) {
+  console.log('\n✗ harness kastede:', e.message);
+  console.log(serverLog.join('').split('\n').slice(-15).join('\n'));
+  kode = 3;
+} finally {
+  srv.kill('SIGTERM');
+  web.close();
+  fremmed.close();
+  setTimeout(() => { srv.kill('SIGKILL'); process.exit(kode); }, 900);
+}
