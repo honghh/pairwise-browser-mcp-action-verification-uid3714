@@ -119,7 +119,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_fill',
-    description: 'Fill a form input field with a value. Supports CSS selectors AND text-based selectors. Auto-scrolls and focuses the element. Works on CSP-strict sites via Chrome Debugger API. For date inputs use browser_set_date, for autocomplete/combobox use browser_set_combobox.',
+    description: 'Fill a form input field with a value. Supports CSS selectors AND text-based selectors. Auto-scrolls and focuses the element. Works on CSP-strict sites via Chrome Debugger API. Success is judged by what the page actually received, not by what the DOM briefly shows: if a controlled component\'s own state did not take the value, the answer is ok:false framework-did-not-hear (use browser_click + browser_press_key instead). For date inputs use browser_set_date, for autocomplete/combobox use browser_set_combobox.',
     inputSchema: {
       type: 'object',
       properties: {
