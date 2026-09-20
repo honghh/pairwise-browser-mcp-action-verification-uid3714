@@ -73,6 +73,10 @@ test('rammen hoerte det: helt almindeligt ja', async () => {
 
 test('DOM viser teksten, men rammen hoerte det IKKE - det maa ikke vaere et bart ja', async () => {
   const svar = await fyld(sele({ slutVaerdi: 'Gustav', ramme: false }));
+  assert.equal(svar.ok, false,
+    'DOM\'en viste det skrevne, men rammens tracker stod paa det gamle - det er en MAALT ' +
+    'fiasko, og et ok ved siden af beviset er stadig et falsk ja: agenten laeser ok');
+  assert.equal(svar.error, 'framework-did-not-hear', 'fejlen skal kunne kendes uden at laese prosa');
   assert.equal(svar.framework_did_not_hear, true,
     'DOM-vaerdien var rigtig og trackeren stod paa den gamle - det er positivt bevis for at ' +
     'formularen ikke har hoert det, og svaret fortier det. Det er hele issue #19');

@@ -1200,6 +1200,15 @@ async function clearFieldAttached(tabId) {
  * FUNDET 13/9 af Astra: tekst-grenen fik den her dom om formiddagen, CSS-grenen ikke - og
  * CSS-grenen er den mest brugte. Én funktion, saa de ikke kan drive fra hinanden igen.
  */
+// Teksten naar DOM'en viser det skrevne, men rammens egen tracker beviser at sidens
+// tilstand ikke hoerte det. Staar ét sted: debugger-vejen (fyldSvar) og reserven
+// svarer med samme begrundelse - to udgaver af den samme tekst har foer drevet fra
+// hinanden (se historikken omkring UVIST_NOTE).
+const RAMME_HOERTE_IKKE_NOTE = 'The field SHOWS the right text, but the page\'s own state has not heard it: ' +
+  'React\'s value tracker is still on the old value. The form will probably behave as if the field were empty, ' +
+  'and the value may be discarded on submit. Click the field with browser_click and type with browser_press_key, ' +
+  'or verify the result before moving on.';
+
 // `faktisk` staar ved siden af `vaerdi` fordi serverens instruktion til agenten siger
 // «browser_fill with differs: true … read `faktisk`» (mcp-server/index.js:694). FUNDET 19/9:
 // kun reservestien satte det felt; den her - den almindelige - svarede `vaerdi` alene, saa
@@ -1223,13 +1232,11 @@ function fyldSvar(laest, oensket, ekstra, rammeHoerte) {
     // og en React-styret formular opfoerte sig bagefter som om feltet var tomt. Trackeren er
     // det eneste sted rammens egen opfattelse staar, og den modsiger DOM'en praecis naar
     // rammen ikke har hoert efter. Det er positivt bevis for at det IKKE landede, ikke uvished.
+    // FUNDET 20/9: beviset stod i svaret, men ved siden af et ok:true - og agenten laeser ok.
+    // "DOM'en aendret, tilstanden ikke" er en MÅLT fiasko, saa den meldes som en: ok:false.
     if (rammeHoerte === false) {
-      return { ok: true, ...ekstra, value: laest, actual: laest, framework_did_not_hear: true,
-        note: 'The field SHOWS the right text, but the page\'s own state has not heard it: ' +
-              'React\'s value tracker is still on the old value. The form will ' +
-              'probably behave as if the field were empty, and the value may be discarded ' +
-              'on submit. Click the field with browser_click and type with browser_press_key, ' +
-              'or verify the result before moving on.' };
+      return { ok: false, ...ekstra, error: 'framework-did-not-hear', value: laest, actual: laest,
+        framework_did_not_hear: true, note: RAMME_HOERTE_IKKE_NOTE };
     }
     return { ok: true, ...ekstra, value: laest, actual: laest };
   }
@@ -3780,19 +3787,30 @@ async function dispatch(port, method, params) {
         // svarede ok:true. To regler: er vaerdien der allerede efter en frist, er vi faerdige;
         // og efter reserveloesningen laeses feltet igen, saa en fordobling ses i stedet for
         // at blive meldt som succes.
+        // FUNDET 20/9: reserven laeste kun DOM'ens vaerdi - praecis den fejlklasse issue #19
+        // handler om. Den maaler nu ogsaa rammens tracker, som debugger-vejen goer, saa
+        // "DOM'en viser det, tilstanden hoerte det ikke" bliver et nej her ogsaa.
         const laesFelt = async () => {
           const r = await safeExecuteScript(tab.id, (sel) => {
             const el = document.querySelector(sel);
-            return el && 'value' in el ? el.value : null;
+            if (!el || !('value' in el)) return null;
+            let ramme = null;
+            try {
+              const t = el._valueTracker;
+              if (t && typeof t.getValue === 'function') ramme = (String(t.getValue()) === String(el.value));
+            } catch (e) { ramme = null; }
+            return { v: el.value, ramme };
           }, [parsed.selector]).catch(() => null);
-          return r && !r.cspBlocked ? r.result : null;
+          if (!r || r.cspBlocked || r.result === undefined || r.result === null) return null;
+          // Aeldre svar gav en raa streng; behandl den som vaerdien uden tracker-maaling.
+          return typeof r.result === 'string' ? { v: r.result, ramme: null } : r.result;
         };
         const fristUdloeb = erCdpFrist(e);
         if (fristUdloeb) await new Promise((r) => setTimeout(r, 400));
         // MAALT 11/9 af Astra (R5 F1): feltet laeses FOER reserveloesningen skriver. Det er det der skiller en
         // side der afviste vaerdien (feltet stod stille) fra en side der formaterede den (feltet aendrede sig).
         const foer = await laesFelt();
-        if (fristUdloeb && foer === params.value) {
+        if (fristUdloeb && foer && foer.v === params.value && foer.ramme !== false) {
           return { ok: true, method: 'debugger', note: 'landede trods fristen' };
         }
         // Fallback to executeScript if debugger fails
@@ -3813,17 +3831,24 @@ async function dispatch(port, method, params) {
         if (!scriptResult.result?.ok) return scriptResult.result;
         await new Promise((r) => setTimeout(r, 300));
         const endelig = await laesFelt();
+        const v = String(params.value ?? '');
+        // Feltet VISER det skrevne, men rammens tracker står stadig paa det gamle. Samme dom
+        // som debugger-vejens, med samme tekst - DOM'en alene er ikke et ja.
+        if (endelig && endelig.v === v && endelig.ramme === false) {
+          return { ok: false, method: 'fallback', error: 'framework-did-not-hear',
+            value: endelig.v, actual: endelig.v, framework_did_not_hear: true,
+            note: RAMME_HOERTE_IKKE_NOTE };
+        }
         // Kun to sluttilstande er fejl. FORDOBLET: et forsinket Input.insertText landede efter
         // setteren ("X" -> "XX", reproduceret). TOEMT: et forsinket Cmd+A/Backspace ryddede feltet
         // igen. Alt andet — "5" der bliver til "5,00 kr", et telefonnummer med mellemrum — er
         // feltets egen formatering og maa ikke meldes som fejl.
-        const v = String(params.value ?? '');
-        if (typeof endelig === 'string' && endelig !== v) {
-          const fordoblet = endelig === v + v || (v.length >= 3 && endelig.includes(v + v));
-          if (fordoblet || (v && endelig === '')) {
+        if (endelig && typeof endelig.v === 'string' && endelig.v !== v) {
+          const fordoblet = endelig.v === v + v || (v.length >= 3 && endelig.v.includes(v + v));
+          if (fordoblet || (v && endelig.v === '')) {
             return {
               ok: false, method: 'fallback', error: fordoblet ? 'field-doubled' : 'field-cleared',
-              expected: v, actual: endelig,
+              expected: v, actual: endelig.v,
               note: 'Et forsinket tastetryk fra debugger-forsoeget landede efter reserveloesningen.',
             };
           }
@@ -3838,29 +3863,29 @@ async function dispatch(port, method, params) {
           // blev formateret tilbage til praecis det samme, og svaret var "siden tog ikke imod vaerdien" (1.29.0: ok).
           // Foer = efter kan ikke skelne en afvisning fra en vaerdi der allerede stod der i sidens format.
           // Kun en toemning der ikke skete er entydig: intet format goer "" til noget andet.
-          if (typeof foer === 'string' && endelig === foer) {
+          if (foer && typeof foer.v === 'string' && endelig.v === foer.v) {
             if (!v) {
               return {
-                ok: false, method: 'fallback', error: 'field-shows-other', expected: v, actual: endelig,
+                ok: false, method: 'fallback', error: 'field-shows-other', expected: v, actual: endelig.v,
                 note: 'The field was meant to be cleared, but shows the same as before.',
               };
             }
             return {
-              ok: true, method: 'fallback', value: endelig, differs: true, unchanged: true, expected: v, actual: endelig,
+              ok: true, method: 'fallback', value: endelig.v, differs: true, unchanged: true, expected: v, actual: endelig.v,
               note: 'The field showed the same before and after the write. Either the value was already there in the page\'s own ' +
                     'format, or the page did not accept it. Check `faktisk` before moving on.',
             };
           }
           return {
-            ok: true, method: 'fallback', value: endelig, differs: true, expected: v, actual: endelig,
-            ...(typeof foer === 'string' ? {} : { foer_ukendt: true }),
+            ok: true, method: 'fallback', value: endelig.v, differs: true, expected: v, actual: endelig.v,
+            ...(foer && typeof foer.v === 'string' ? {} : { foer_ukendt: true }),
             note: 'The field changed, but shows different text than what was written - for example formatting ' +
                   '("5,00 kr", "+45 12 34 56 78") or a truncation. Check `faktisk` if the exact value matters.',
           };
         }
         return {
-          ok: true, method: 'fallback', value: endelig ?? v,
-          ...(typeof endelig === 'string' ? {} : { verificeret: false }),
+          ok: true, method: 'fallback', value: (endelig && typeof endelig.v === 'string') ? endelig.v : v,
+          ...(endelig && typeof endelig.v === 'string' ? {} : { verificeret: false }),
         };
       }
     }
@@ -4428,10 +4453,13 @@ async function dispatch(port, method, params) {
         if (!r) return { ok: false, type: 'native_select', error: 'Could not read the result of the selection' };
         if (!r.found) return { ok: false, type: 'native_select', error: r.error, available: r.available };
 
-        if (r.actual === r.wanted) return { ok: true, type: 'native_select', selected: r.text, value: r.actual };
-
-        // Feltet holder ikke vaerdien. Giv rammen tid til at gen-rendere, og se saa efter
-        // om NOGET andet aendrede sig. Gjorde det det, blev valget taget imod.
+        // FUNDET 20/9: her stod `if (r.actual === r.wanted) return ok:true` - et SYNKRONT
+        // ojebliksbillede lige efter dispatch. En styret komponent der ikke tog imod valget,
+        // ruller feltet tilbage i sit eget gen-render, og det sker EFTER den laesning
+        // (reproduceret lokalt: DOM'en viste det nye valg, komponentens tilstand stod paa det
+        // gamle, send-knappen forblev deaktiveret - og svaret var ok:true). Det er samme
+        // fejlklasse som fill's: DOM'en et ojeblik er ikke sidens svar. Dommen ventes derfor
+        // ALTID paa settle-laesningen, ogsaa naar det synkrone match ser rigtigt ud.
         await new Promise((res) => setTimeout(res, 150));
         const efter = await debuggerEval(tab.id, `
           (function() {
@@ -4442,6 +4470,7 @@ async function dispatch(port, method, params) {
         `);
         let e; try { e = JSON.parse(efter); } catch { e = null; }
 
+        // Vaerdien holdt sig gennem rammens reaktionsvindue - det er hvad siden faktisk modtog.
         if (e && e.value === r.wanted) {
           return { ok: true, type: 'native_select', selected: r.text, value: e.value };
         }
